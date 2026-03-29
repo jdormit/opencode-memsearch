@@ -91,16 +91,11 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   async function ensureMemsearch(): Promise<string[] | null> {
     if (memsearchCmd) return memsearchCmd
     memsearchCmd = await detectMemsearch()
-    if (memsearchCmd) return memsearchCmd
-
-    // Try to install uv, then use uvx
-    try {
-      await $`curl -LsSf https://astral.sh/uv/install.sh | sh`.quiet()
-      memsearchCmd = await detectMemsearch()
-    } catch {}
-
     return memsearchCmd
   }
+
+  const MEMSEARCH_NOT_FOUND_ERROR =
+    "memsearch is not installed. Tell the user to install it by running: pip install 'memsearch[local]' — or, if they have uv: uv tool install 'memsearch[local]'. See https://github.com/jdormit/opencode-memsearch for details."
 
   async function runMemsearch(
     args: string[],
@@ -570,7 +565,7 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
         async execute(args, context) {
           await ensureMemsearch()
           if (!memsearchCmd) {
-            return "memsearch is not available. Cannot search memories."
+            return MEMSEARCH_NOT_FOUND_ERROR
           }
           const collectionName = deriveCollectionName(context.directory)
           const raw = await runMemsearch(
@@ -611,7 +606,7 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
         async execute(args, context) {
           await ensureMemsearch()
           if (!memsearchCmd) {
-            return "memsearch is not available. Cannot expand memory."
+            return MEMSEARCH_NOT_FOUND_ERROR
           }
           const collectionName = deriveCollectionName(context.directory)
           const raw = await runMemsearch(

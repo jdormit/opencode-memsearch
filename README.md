@@ -31,7 +31,7 @@ Or install directly with pip:
 pip install 'memsearch[local]'
 ```
 
-> The plugin will attempt to auto-install `uv` if neither `memsearch` nor `uvx` is found on your PATH, but installing it ahead of time is recommended.
+If `memsearch` is not installed, the plugin's tools will return a clear error message asking the agent to tell you to install it.
 
 ## Install
 
