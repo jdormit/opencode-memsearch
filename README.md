@@ -57,7 +57,7 @@ OpenCode will install the npm package automatically on startup.
 When the agent finishes responding (session goes idle), the plugin:
 
 1. Extracts the last conversation turn (user message + agent response)
-2. Summarizes it into 2-6 bullet points using Claude Haiku via `opencode run`
+2. Summarizes it into 2-6 bullet points using an LLM (Claude Haiku by default, [configurable](#summarization-model)) via `opencode run`
 3. Appends the summary to `.memsearch/memory/YYYY-MM-DD.md`
 4. Re-indexes the memory directory into the vector database
 
@@ -102,23 +102,134 @@ bun run scripts/seed-memories.ts
 bun run scripts/seed-memories.ts --days 30
 ```
 
-The script reads directly from the OpenCode SQLite database, summarizes each conversation turn with Claude Haiku, and writes the results to `.memsearch/memory/`.
+The script reads directly from the OpenCode SQLite database, summarizes each conversation turn, and writes the results to `.memsearch/memory/`. The seed script respects the same [configuration](#configuration) as the plugin (config file and environment variables).
 
 ## Configuration
 
-The plugin auto-configures memsearch to use local embeddings. If you want to use a remote Milvus instance instead of the default local database, configure it via the memsearch CLI:
+The plugin can be configured via a JSON config file and/or environment variables. Environment variables take precedence over config file values, and project-level config takes precedence over global config.
+
+### Config file
+
+The plugin looks for config in two locations (highest precedence first):
+
+1. **Project config**: `.memsearch/config.json` in your project root
+2. **Global config**: `~/.config/opencode/memsearch.config.json`
+
+Both files use the same schema. Values from the project config override the global config.
+
+**Example:**
+
+```json
+{
+  "summarization_model": "anthropic/claude-sonnet-4-5",
+  "auto_configure_embedding": true
+}
+```
+
+All fields are optional. The full schema:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `summarization_model` | `string` | `"anthropic/claude-haiku-4-5"` | The OpenCode model ID used to summarize conversation turns |
+| `auto_configure_embedding` | `boolean` | `true` | Whether the plugin auto-configures memsearch to use local embeddings on startup |
+
+### Summarization model
+
+Each conversation turn is summarized by an LLM before being stored. By default, the plugin uses `anthropic/claude-haiku-4-5` — a fast, cheap model that produces good summaries.
+
+To use a different model, set it in your config file:
+
+```json
+{
+  "summarization_model": "anthropic/claude-sonnet-4-5"
+}
+```
+
+Or override it with an environment variable:
+
+```bash
+export MEMSEARCH_SUMMARIZATION_MODEL="openai/gpt-4.1-mini"
+```
+
+The model must be available in your OpenCode configuration (i.e., you must have the provider configured and authenticated). Any model ID that works with `opencode run --model <id>` will work here.
+
+### Milvus storage
+
+The plugin uses [Milvus](https://milvus.io/) (via memsearch) as its vector database. There are two modes:
+
+#### Local mode (default)
+
+By default, memsearch uses **Milvus Lite**, which stores data in a local `.db` file (typically `~/.memsearch/milvus.db`). This requires no server setup — it just works.
+
+In local mode, the plugin re-indexes the memory directory on session start (to pick up any memories written since the last session) and again after each new summary is appended. File locking prevents concurrent access issues, so no background watcher is needed.
+
+#### Remote mode
+
+For concurrent access from multiple sessions or machines, you can point memsearch at a remote Milvus server:
 
 ```bash
 memsearch config set milvus.uri http://localhost:19530
 ```
 
-In remote mode, the plugin starts a file watcher process that automatically re-indexes memory files when they change.
+In remote mode, the plugin starts a **file watcher** process that continuously re-indexes memory files whenever they change. The watcher runs as a background process with its PID stored in `.memsearch/.watch.pid`.
 
-## Environment variables
+To switch back to local mode:
+
+```bash
+memsearch config set milvus.uri "~/.memsearch/milvus.db"
+```
+
+### Embedding provider
+
+By default, the plugin auto-configures memsearch to use **local embeddings** (`embedding.provider = local`). This is important because memsearch's own default is `openai`, which would require an API key and make network requests for every index and search operation.
+
+With local embeddings, the `all-MiniLM-L6-v2` model runs on your machine — no API calls needed for vector search.
+
+To manage the embedding provider yourself (e.g., to use OpenAI embeddings or a custom endpoint), disable auto-configuration:
+
+```json
+{
+  "auto_configure_embedding": false
+}
+```
+
+Or via environment variable:
+
+```bash
+export MEMSEARCH_AUTO_CONFIGURE_EMBEDDING=false
+```
+
+Then configure memsearch directly:
+
+```bash
+# Example: use OpenAI embeddings
+memsearch config set embedding.provider openai
+memsearch config set embedding.api_key "env:OPENAI_API_KEY"
+
+# Example: use a custom OpenAI-compatible endpoint
+memsearch config set embedding.provider openai
+memsearch config set embedding.base_url http://localhost:11434/v1
+memsearch config set embedding.model nomic-embed-text
+```
+
+See the [memsearch documentation](https://github.com/nicobako/memsearch) for all available embedding options.
+
+### Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `MEMSEARCH_DISABLE` | Set to any value to disable the plugin (used internally to prevent recursion during summarization) |
+| `MEMSEARCH_SUMMARIZATION_MODEL` | Override the model used for summarization (takes precedence over config file) |
+| `MEMSEARCH_AUTO_CONFIGURE_EMBEDDING` | Set to `false` or `0` to disable automatic local embedding configuration |
+| `MEMSEARCH_DISABLE` | Set to any value to disable the plugin entirely (used internally to prevent recursion during summarization) |
+
+### Precedence
+
+Configuration values are resolved in this order (highest precedence first):
+
+1. Environment variables
+2. Project config (`.memsearch/config.json`)
+3. Global config (`~/.config/opencode/memsearch.config.json`)
+4. Built-in defaults
 
 ## License
 

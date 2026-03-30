@@ -2,7 +2,51 @@ import { type Plugin, tool } from "@opencode-ai/plugin"
 import { createHash } from "crypto"
 import { readdir, readFile, appendFile, mkdir, writeFile, unlink } from "fs/promises"
 import { join, basename, resolve } from "path"
-import { tmpdir } from "os"
+import { tmpdir, homedir } from "os"
+
+// --- Configuration ---
+
+interface PluginConfig {
+  /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
+  summarization_model?: string
+  /** Whether to auto-configure memsearch to use local embeddings (default: true) */
+  auto_configure_embedding?: boolean
+}
+
+const DEFAULT_SUMMARIZATION_MODEL = "anthropic/claude-haiku-4-5"
+const GLOBAL_CONFIG_PATH = join(homedir(), ".config", "opencode", "memsearch.config.json")
+
+async function loadJsonConfig(path: string): Promise<Partial<PluginConfig>> {
+  try {
+    const content = await readFile(path, "utf-8")
+    return JSON.parse(content)
+  } catch {
+    return {}
+  }
+}
+
+async function loadConfig(projectDir: string): Promise<PluginConfig> {
+  const projectPath = join(projectDir, ".memsearch", "config.json")
+  const globalConfig = await loadJsonConfig(GLOBAL_CONFIG_PATH)
+  const projectConfig = await loadJsonConfig(projectPath)
+  return { ...globalConfig, ...projectConfig }
+}
+
+function getSummarizationModel(config: PluginConfig): string {
+  return (
+    process.env.MEMSEARCH_SUMMARIZATION_MODEL ||
+    config.summarization_model ||
+    DEFAULT_SUMMARIZATION_MODEL
+  )
+}
+
+function shouldAutoConfigureEmbedding(config: PluginConfig): boolean {
+  const envVal = process.env.MEMSEARCH_AUTO_CONFIGURE_EMBEDDING
+  if (envVal !== undefined) {
+    return envVal !== "0" && envVal.toLowerCase() !== "false"
+  }
+  return config.auto_configure_embedding !== false
+}
 
 // --- Helpers ---
 
@@ -48,7 +92,6 @@ Rules:
 - Do NOT ask follow-up questions
 - STOP immediately after the last bullet point`
 
-const HAIKU_MODEL = "anthropic/claude-haiku-4-5"
 const TEMP_DIR = join(tmpdir(), "memsearch-plugin")
 
 // --- Session state tracking ---
@@ -263,13 +306,13 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   }
 
   // Summarize a transcript via `opencode run` in a separate process with plugins disabled
-  async function summarizeTranscript(transcript: string, sessionID: string, turnIdx: number): Promise<string> {
+  async function summarizeTranscript(transcript: string, sessionID: string, turnIdx: number, model: string): Promise<string> {
     const tempFile = join(TEMP_DIR, `turn-${sessionID}-${turnIdx}.txt`)
     await mkdir(TEMP_DIR, { recursive: true })
     await writeFile(tempFile, transcript)
 
     try {
-      const rawOutput = await $`opencode run -f ${tempFile} --model ${HAIKU_MODEL} --format json ${SUMMARIZE_PROMPT}`
+      const rawOutput = await $`opencode run -f ${tempFile} --model ${model} --format json ${SUMMARIZE_PROMPT}`
         .env({ ...process.env, MEMSEARCH_DISABLE: "1" })
         .nothrow()
         .quiet()
@@ -369,7 +412,10 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
 
   // --- Initialize ---
   await ensureMemsearch()
-  if (memsearchCmd) {
+  const pluginConfig = await loadConfig(directory)
+  const summarizationModel = getSummarizationModel(pluginConfig)
+
+  if (memsearchCmd && shouldAutoConfigureEmbedding(pluginConfig)) {
     await configureLocalEmbedding()
   }
 
@@ -509,7 +555,7 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
           // Summarize via LLM, fall back to raw extraction on failure
           let summary: string
           try {
-            summary = await summarizeTranscript(transcript, sessionID, state.lastSummarizedMessageCount)
+            summary = await summarizeTranscript(transcript, sessionID, state.lastSummarizedMessageCount, summarizationModel)
           } catch {
             summary = ""
           }

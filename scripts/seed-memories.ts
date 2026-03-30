@@ -8,17 +8,53 @@
  * This script:
  * 1. Reads session + message data directly from the OpenCode SQLite database
  * 2. For each session, formats each conversation turn as a transcript
- * 3. Summarizes each turn via `opencode run` with claude-haiku (one process per turn)
+ * 3. Summarizes each turn via `opencode run` (model is configurable, see README)
  * 4. Writes summaries to .memsearch/memory/YYYY-MM-DD.md files per project
  * 5. Indexes all memory files with memsearch
  */
 
 import { Database } from "bun:sqlite"
 import { createHash } from "crypto"
-import { appendFile, mkdir, writeFile, unlink } from "fs/promises"
+import { appendFile, mkdir, readFile, writeFile, unlink } from "fs/promises"
 import { join, basename, resolve } from "path"
 import { homedir, tmpdir } from "os"
 import { $ } from "bun"
+
+// --- Configuration ---
+
+interface PluginConfig {
+  /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
+  summarization_model?: string
+  /** Whether to auto-configure memsearch to use local embeddings (default: true) */
+  auto_configure_embedding?: boolean
+}
+
+const DEFAULT_SUMMARIZATION_MODEL = "anthropic/claude-haiku-4-5"
+const GLOBAL_CONFIG_PATH = join(homedir(), ".config", "opencode", "memsearch.config.json")
+
+async function loadJsonConfig(path: string): Promise<Partial<PluginConfig>> {
+  try {
+    const content = await readFile(path, "utf-8")
+    return JSON.parse(content)
+  } catch {
+    return {}
+  }
+}
+
+async function loadConfig(projectDir: string): Promise<PluginConfig> {
+  const projectPath = join(projectDir, ".memsearch", "config.json")
+  const globalConfig = await loadJsonConfig(GLOBAL_CONFIG_PATH)
+  const projectConfig = await loadJsonConfig(projectPath)
+  return { ...globalConfig, ...projectConfig }
+}
+
+function getSummarizationModel(config: PluginConfig): string {
+  return (
+    process.env.MEMSEARCH_SUMMARIZATION_MODEL ||
+    config.summarization_model ||
+    DEFAULT_SUMMARIZATION_MODEL
+  )
+}
 
 // --- Config ---
 
@@ -38,8 +74,6 @@ Rules:
 - Do NOT continue the conversation after the bullet points
 - Do NOT ask follow-up questions
 - STOP immediately after the last bullet point`
-
-const HAIKU_MODEL = "anthropic/claude-haiku-4-5"
 
 const DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db")
 const TEMP_DIR = join(tmpdir(), "memsearch-seed")
@@ -287,14 +321,14 @@ async function detectMemsearch(): Promise<string[]> {
 }
 
 // Summarize a transcript via `opencode run`
-async function summarizeWithOpencode(transcript: string, tempFile: string): Promise<string> {
+async function summarizeWithOpencode(transcript: string, tempFile: string, model: string): Promise<string> {
   // Write transcript to temp file
   await writeFile(tempFile, transcript)
 
   try {
     // Disable all plugins during summarization to avoid memsearch plugin
     // interfering with the LLM output (e.g. injecting "[memsearch] Memory available")
-    const rawOutput = await $`opencode run -f ${tempFile} --model ${HAIKU_MODEL} ${SUMMARIZE_PROMPT}`
+    const rawOutput = await $`opencode run -f ${tempFile} --model ${model} ${SUMMARIZE_PROMPT}`
       .env({ ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [] }) })
       .nothrow()
       .quiet()
@@ -330,6 +364,11 @@ async function main() {
   // Setup
   const memsearchCmd = await detectMemsearch()
   console.log(`Using memsearch: ${memsearchCmd.join(" ")}`)
+
+  // Load config from cwd (the project root the seed script is run from)
+  const config = await loadConfig(process.cwd())
+  const summarizationModel = getSummarizationModel(config)
+  console.log(`Summarization model: ${summarizationModel}`)
 
   await mkdir(TEMP_DIR, { recursive: true })
 
@@ -426,7 +465,7 @@ async function main() {
         const tempFile = join(TEMP_DIR, `turn-${sessionNum}-${turnIdx}.txt`)
         let summary = ""
         try {
-          summary = await summarizeWithOpencode(transcript, tempFile)
+          summary = await summarizeWithOpencode(transcript, tempFile, summarizationModel)
           if (summary) totalSummarized++
         } catch {
           // LLM failed
