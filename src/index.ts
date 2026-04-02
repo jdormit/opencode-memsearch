@@ -1,6 +1,6 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import { createHash } from "crypto"
-import { readdir, readFile, appendFile, mkdir, writeFile, unlink, access, stat } from "fs/promises"
+import { readdir, readFile, appendFile, mkdir, writeFile, unlink, access } from "fs/promises"
 import { join, basename, resolve, dirname } from "path"
 import { tmpdir, homedir } from "os"
 import { createConnection } from "net"
@@ -11,8 +11,6 @@ import { fileURLToPath } from "url"
 interface PluginConfig {
   /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
   summarization_model?: string
-  /** Whether to auto-configure memsearch to use local embeddings (default: true) */
-  auto_configure_embedding?: boolean
   /** Whether to use the daemon for faster search/index (default: true) */
   use_daemon?: boolean
 }
@@ -42,14 +40,6 @@ function getSummarizationModel(config: PluginConfig): string {
     config.summarization_model ||
     DEFAULT_SUMMARIZATION_MODEL
   )
-}
-
-function shouldAutoConfigureEmbedding(config: PluginConfig): boolean {
-  const envVal = process.env.MEMSEARCH_AUTO_CONFIGURE_EMBEDDING
-  if (envVal !== undefined) {
-    return envVal !== "0" && envVal.toLowerCase() !== "false"
-  }
-  return config.auto_configure_embedding !== false
 }
 
 function shouldUseDaemon(config: PluginConfig): boolean {
@@ -215,41 +205,40 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
       await $`which memsearch`.quiet()
       return ["memsearch"]
     } catch {}
-    try {
-      await $`which uvx`.quiet()
-      return ["uvx", "--from", "memsearch[local]", "memsearch"]
-    } catch {}
     return null
   }
 
-  /** Find the Python interpreter that memsearch uses (for the daemon). */
+  /**
+   * Find the Python interpreter that has memsearch available (for the daemon).
+   *
+   * Strategy:
+   * 1. Read the shebang from the `memsearch` CLI script — this directly
+   *    points at the Python that memsearch was installed into, whether
+   *    that's a uv tool venv, a pip virtualenv, or system Python.
+   * 2. Fall back to probing system python3/python for `import memsearch`.
+   */
   async function detectMemsearchPython(): Promise<string | null> {
     if (memsearchPythonPath) return memsearchPythonPath
 
-    // If memsearch is installed as a tool via uv, find its Python
+    // Strategy 1: read the shebang from the memsearch CLI script
     try {
       const memsearchBin = (await $`which memsearch`.quiet().text()).trim()
       if (memsearchBin) {
-        // Read the shebang or follow the symlink to find the venv python
-        const realPath = (await $`readlink -f ${memsearchBin}`.quiet().text()).trim()
-        const binDir = dirname(realPath)
-        // Try sibling python3 in the same venv bin
-        const venvPython = join(binDir, "python3")
-        try {
-          await access(venvPython)
-          memsearchPythonPath = venvPython
-          return venvPython
-        } catch {}
-        const venvPython2 = join(binDir, "python")
-        try {
-          await access(venvPython2)
-          memsearchPythonPath = venvPython2
-          return venvPython2
-        } catch {}
+        const content = await readFile(memsearchBin, "utf-8")
+        const firstLine = content.split("\n")[0]
+        if (firstLine.startsWith("#!")) {
+          const shebangPath = firstLine.slice(2).trim()
+          // Verify this Python can actually import memsearch
+          try {
+            await $`${shebangPath} -c "import memsearch"`.quiet()
+            memsearchPythonPath = shebangPath
+            return shebangPath
+          } catch {}
+        }
       }
     } catch {}
 
-    // Fall back: try to import memsearch from system python
+    // Strategy 2: try system python
     for (const py of ["python3", "python"]) {
       try {
         await $`${py} -c "import memsearch"`.quiet()
@@ -268,7 +257,7 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   }
 
   const MEMSEARCH_NOT_FOUND_ERROR =
-    "memsearch is not installed. Tell the user to install it by running: pip install 'memsearch[local]' — or, if they have uv: uv tool install 'memsearch[local]'. See https://github.com/jdormit/opencode-memsearch for details."
+    "memsearch is not installed. Tell the user to install it by running: uv tool install 'memsearch[onnx]' — or with pip: pip install 'memsearch[onnx]'. See https://github.com/jdormit/opencode-memsearch for details."
 
   async function runMemsearch(
     args: string[],
@@ -293,17 +282,6 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
       return (await $`${[...cmd, "config", "get", key]}`.quiet().text()).trim()
     } catch {
       return ""
-    }
-  }
-
-  async function configureLocalEmbedding(): Promise<void> {
-    const cmd = memsearchCmd
-    if (!cmd) return
-    const provider = await getMemsearchConfig("embedding.provider")
-    if (provider !== "local") {
-      try {
-        await $`${[...cmd, "config", "set", "embedding.provider", "local"]}`.quiet()
-      } catch {}
     }
   }
 
@@ -702,10 +680,6 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   const pluginConfig = await loadConfig(directory)
   const summarizationModel = getSummarizationModel(pluginConfig)
   const useDaemon = shouldUseDaemon(pluginConfig)
-
-  if (memsearchCmd && shouldAutoConfigureEmbedding(pluginConfig)) {
-    await configureLocalEmbedding()
-  }
 
   return {
     // Event handler for session lifecycle
