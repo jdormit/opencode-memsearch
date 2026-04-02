@@ -11,6 +11,7 @@ This plugin gives your OpenCode agent long-term memory. It automatically summari
 - **Semantic search** — two custom tools (`memsearch_search` and `memsearch_expand`) let the agent search and drill into past memories
 - **Per-project isolation** — memory collections are scoped by project directory
 - **Local embeddings** — uses memsearch's local embedding provider, so no API calls are needed for vector search
+- **Daemon mode** — optional background daemon keeps the embedding model loaded in memory, reducing search latency from ~10s to ~50ms on machines with slow Python/PyTorch startup
 - **Memory protocol** — a system prompt directive instructs the agent to check memory at session start and whenever it encounters a topic that might have prior context
 
 ## Prerequisites
@@ -132,6 +133,7 @@ All fields are optional. The full schema:
 |-------|------|---------|-------------|
 | `summarization_model` | `string` | `"anthropic/claude-haiku-4-5"` | The OpenCode model ID used to summarize conversation turns |
 | `auto_configure_embedding` | `boolean` | `true` | Whether the plugin auto-configures memsearch to use local embeddings on startup |
+| `use_daemon` | `boolean` | `true` | Whether to use a background daemon for faster search/index operations |
 
 ### Summarization model
 
@@ -214,12 +216,40 @@ memsearch config set embedding.model nomic-embed-text
 
 See the [memsearch documentation](https://github.com/nicobako/memsearch) for all available embedding options.
 
+### Daemon mode
+
+By default, the plugin starts a background daemon process that keeps the memsearch embedding model loaded in memory. This avoids the Python/PyTorch cold-start penalty (~8-11s) on every search, index, or expand operation — reducing latency to ~50ms.
+
+The daemon:
+- Starts automatically on session creation
+- Listens on a Unix domain socket at `.memsearch/daemon.sock`
+- Falls back to the CLI transparently if the daemon is unavailable
+- Writes logs to `.memsearch/daemon.log`
+- Stores its PID in `.memsearch/daemon.pid`
+
+To disable the daemon and use the CLI for all operations:
+
+```json
+{
+  "use_daemon": false
+}
+```
+
+Or via environment variable:
+
+```bash
+export MEMSEARCH_USE_DAEMON=false
+```
+
+The daemon is most beneficial on machines where Python startup is slow (older hardware, CPU-only inference). On fast machines with NVMe storage, the difference may be negligible.
+
 ### Environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `MEMSEARCH_SUMMARIZATION_MODEL` | Override the model used for summarization (takes precedence over config file) |
 | `MEMSEARCH_AUTO_CONFIGURE_EMBEDDING` | Set to `false` or `0` to disable automatic local embedding configuration |
+| `MEMSEARCH_USE_DAEMON` | Set to `false` or `0` to disable the background daemon (uses CLI for all operations) |
 | `MEMSEARCH_DISABLE` | Set to any value to disable the plugin entirely (used internally to prevent recursion during summarization) |
 
 ### Precedence
