@@ -3,7 +3,9 @@
  * seed-memories.ts — Seed memsearch memory files from recent OpenCode sessions.
  *
  * Usage:
- *   bun run ~/.config/opencode/scripts/seed-memories.ts [--days 14]
+ *   npx opencode-memsearch-seed [--days 14]
+ *
+ * Requires Bun (https://bun.sh/) to run.
  *
  * This script:
  * 1. Reads session + message data directly from the OpenCode SQLite database
@@ -25,8 +27,8 @@ import { $ } from "bun"
 interface PluginConfig {
   /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
   summarization_model?: string
-  /** Whether to auto-configure memsearch to use local embeddings (default: true) */
-  auto_configure_embedding?: boolean
+  /** Whether to use the daemon for faster search/index (default: true) */
+  use_daemon?: boolean
 }
 
 const DEFAULT_SUMMARIZATION_MODEL = "anthropic/claude-haiku-4-5"
@@ -313,11 +315,9 @@ async function detectMemsearch(): Promise<string[]> {
     await $`which memsearch`.quiet()
     return ["memsearch"]
   } catch {}
-  try {
-    await $`which uvx`.quiet()
-    return ["uvx", "--from", "memsearch[local]", "memsearch"]
-  } catch {}
-  throw new Error("memsearch not found. Install it with: pip install 'memsearch[local]' or install uv")
+  throw new Error(
+    "memsearch is not installed. Install it by running: uv tool install 'memsearch[onnx]' — or with pip: pip install 'memsearch[onnx]'. See https://github.com/jdormit/opencode-memsearch for details."
+  )
 }
 
 // Summarize a transcript via `opencode run`
