@@ -97,21 +97,27 @@ your-project/
 
 You should add `.memsearch/` to your `.gitignore`.
 
-## Seed script
+## CLI
 
-The package includes a seed script that can backfill memory from existing OpenCode sessions. This is useful when first installing the plugin on a project you've already been working on.
+The package includes a CLI for utility tasks. It requires [Bun](https://bun.sh/) to run.
 
-The seed script requires [Bun](https://bun.sh/) to run.
+```bash
+bunx opencode-memsearch --help
+```
+
+### Seed
+
+Backfill memory from existing OpenCode sessions. This is useful when first installing the plugin on a project you've already been working on.
 
 ```bash
 # Seed from the last 14 days of sessions (default)
-npx opencode-memsearch-seed
+bunx opencode-memsearch seed
 
 # Seed from the last 30 days
-npx opencode-memsearch-seed --days 30
+bunx opencode-memsearch seed --days 30
 ```
 
-Run the script from your project directory. It reads directly from the OpenCode SQLite database, summarizes each conversation turn, and writes the results to `.memsearch/memory/`. The seed script respects the same [configuration](#configuration) as the plugin (config file and environment variables).
+Run the command from your project directory. It reads directly from the OpenCode SQLite database, summarizes each conversation turn, and writes the results to `.memsearch/memory/`. The seed command respects the same [configuration](#configuration) as the plugin (config file and environment variables).
 
 ## Configuration
 

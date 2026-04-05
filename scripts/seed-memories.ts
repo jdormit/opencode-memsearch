@@ -1,13 +1,9 @@
-#!/usr/bin/env bun
 /**
  * seed-memories.ts — Seed memsearch memory files from recent OpenCode sessions.
  *
- * Usage:
- *   npx opencode-memsearch-seed [--days 14]
+ * This module exports a `seed` function used by the CLI (cli.ts).
  *
- * Requires Bun (https://bun.sh/) to run.
- *
- * This script:
+ * What it does:
  * 1. Reads session + message data directly from the OpenCode SQLite database
  * 2. For each session, formats each conversation turn as a transcript
  * 3. Summarizes each turn via `opencode run` (model is configurable, see README)
@@ -105,21 +101,6 @@ function formatDate(epochMs: number): string {
 function formatTime(epochMs: number): string {
   const d = new Date(epochMs)
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
-}
-
-function parseArgs(): { days: number } {
-  const args = process.argv.slice(2)
-  let days = 14
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--days" && args[i + 1]) {
-      days = parseInt(args[i + 1], 10)
-      if (isNaN(days) || days < 1) {
-        console.error("Invalid --days value, using default 14")
-        days = 14
-      }
-    }
-  }
-  return { days }
 }
 
 // --- Database types ---
@@ -354,8 +335,8 @@ async function summarizeWithOpencode(transcript: string, tempFile: string, model
 
 // --- Main ---
 
-async function main() {
-  const { days } = parseArgs()
+export async function seed(opts: { days: number }) {
+  const { days } = opts
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
 
   console.log(`Seeding memories from the last ${days} days...`)
@@ -514,7 +495,4 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err)
-  process.exit(1)
-})
+

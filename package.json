@@ -1,6 +1,6 @@
 {
   "name": "opencode-memsearch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Persistent cross-session memory for OpenCode, powered by memsearch",
   "type": "module",
   "main": "dist/index.js",
@@ -12,7 +12,7 @@
     }
   },
   "bin": {
-    "opencode-memsearch-seed": "scripts/seed-memories.ts"
+    "opencode-memsearch": "scripts/cli.ts"
   },
   "files": [
     "dist",
