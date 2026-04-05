@@ -9,6 +9,7 @@
  */
 
 import { seed } from "./seed-memories"
+import { reindex } from "./reindex"
 
 const HELP = `opencode-memsearch — CLI utilities for the opencode-memsearch plugin
 
@@ -16,7 +17,8 @@ Usage:
   opencode-memsearch <command> [options]
 
 Commands:
-  seed    Backfill memory from existing OpenCode sessions
+  seed      Backfill memory from existing OpenCode sessions
+  reindex   Reset and rebuild vector index from existing memory files
 
 Options:
   --help, -h    Show this help message
@@ -36,6 +38,23 @@ Options:
   --days <n>    Number of days of history to process (default: 14)
   --help, -h    Show this help message`
 
+const REINDEX_HELP = `Reset and rebuild the vector index from existing memory files.
+
+Discovers all project directories from the OpenCode session database,
+resets each memsearch collection, and re-indexes the .memsearch/memory/
+markdown files using the currently configured embedding provider.
+
+This is useful after switching embedding providers (e.g. memsearch[local]
+to memsearch[onnx]) — it rebuilds the vector index without re-running the
+expensive LLM summarization from 'seed'.
+
+Usage:
+  opencode-memsearch reindex [--dry-run]
+
+Options:
+  --dry-run     Preview what would be reset/reindexed without making changes
+  --help, -h    Show this help message`
+
 function parseSeedArgs(args: string[]): { days: number } {
   let days = 14
   for (let i = 0; i < args.length; i++) {
@@ -48,6 +67,10 @@ function parseSeedArgs(args: string[]): { days: number } {
     }
   }
   return { days }
+}
+
+function parseReindexArgs(args: string[]): { dryRun: boolean } {
+  return { dryRun: args.includes("--dry-run") }
 }
 
 async function main() {
@@ -68,6 +91,16 @@ async function main() {
       }
       const { days } = parseSeedArgs(subArgs)
       await seed({ days })
+      break
+    }
+    case "reindex": {
+      const subArgs = args.slice(1)
+      if (subArgs.includes("--help") || subArgs.includes("-h")) {
+        console.log(REINDEX_HELP)
+        process.exit(0)
+      }
+      const { dryRun } = parseReindexArgs(subArgs)
+      await reindex({ dryRun })
       break
     }
     default:
