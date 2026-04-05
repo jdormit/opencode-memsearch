@@ -25,9 +25,9 @@ Run 'opencode-memsearch <command> --help' for command-specific help.`
 
 const SEED_HELP = `Seed memsearch memory files from recent OpenCode sessions.
 
-Reads session data from the OpenCode SQLite database, summarizes each
-conversation turn via an LLM, and writes the results to .memsearch/memory/.
-Run this from your project directory.
+Reads all sessions from the OpenCode SQLite database, summarizes each
+conversation turn via an LLM, and writes the results to each project's
+.memsearch/memory/ directory. Processes all projects; can be run from anywhere.
 
 Usage:
   opencode-memsearch seed [--days <n>]

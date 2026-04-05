@@ -117,7 +117,7 @@ bunx opencode-memsearch seed
 bunx opencode-memsearch seed --days 30
 ```
 
-Run the command from your project directory. It reads directly from the OpenCode SQLite database, summarizes each conversation turn, and writes the results to `.memsearch/memory/`. The seed command respects the same [configuration](#configuration) as the plugin (config file and environment variables).
+The command reads directly from the OpenCode SQLite database, processes all sessions across all projects, summarizes each conversation turn, and writes the results to each project's `.memsearch/memory/` directory. It can be run from anywhere. The seed command respects the same [configuration](#configuration) as the plugin (config file and environment variables).
 
 ## Configuration
 
