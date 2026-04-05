@@ -10,26 +10,33 @@ This plugin gives your OpenCode agent long-term memory. It automatically summari
 - **Cold-start context** — the last 30 lines of the 2 most recent memory files are injected into the system prompt when a new session starts
 - **Semantic search** — two custom tools (`memsearch_search` and `memsearch_expand`) let the agent search and drill into past memories
 - **Per-project isolation** — memory collections are scoped by project directory
-- **Local embeddings** — uses memsearch's local embedding provider, so no API calls are needed for vector search
+- **Local embeddings** — works with memsearch's ONNX or local embedding providers, so no API keys are needed for vector search
+- **Daemon mode** — optional background daemon keeps the embedding model loaded in memory, reducing search latency from ~5-10s to ~50ms
 - **Memory protocol** — a system prompt directive instructs the agent to check memory at session start and whenever it encounters a topic that might have prior context
 
 ## Prerequisites
 
-You need the `memsearch` CLI installed. The easiest way is via [uv](https://docs.astral.sh/uv/):
+You need the `memsearch` CLI installed with ONNX embeddings. The easiest way is via [uv](https://docs.astral.sh/uv/):
 
 ```bash
 # Install uv (if you don't have it)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install memsearch with local embeddings
-uv tool install 'memsearch[local]'
+# Install memsearch with ONNX embeddings (recommended)
+uv tool install 'memsearch[onnx]'
+
+# Configure the ONNX embedding provider
+memsearch config set embedding.provider onnx
 ```
 
 Or install directly with pip:
 
 ```bash
-pip install 'memsearch[local]'
+pip install 'memsearch[onnx]'
+memsearch config set embedding.provider onnx
 ```
+
+The ONNX provider uses the `bge-m3` embedding model locally on your machine — no API keys or network requests needed for vector search. If you prefer a different embedding provider (e.g., OpenAI, a local `all-MiniLM-L6-v2` via `memsearch[local]`, or Ollama), see the [memsearch documentation](https://github.com/nicobako/memsearch) for configuration options.
 
 If `memsearch` is not installed, the plugin's tools will return a clear error message asking the agent to tell you to install it.
 
@@ -122,7 +129,7 @@ Both files use the same schema. Values from the project config override the glob
 ```json
 {
   "summarization_model": "anthropic/claude-sonnet-4-5",
-  "auto_configure_embedding": true
+  "use_daemon": true
 }
 ```
 
@@ -131,7 +138,7 @@ All fields are optional. The full schema:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `summarization_model` | `string` | `"anthropic/claude-haiku-4-5"` | The OpenCode model ID used to summarize conversation turns |
-| `auto_configure_embedding` | `boolean` | `true` | Whether the plugin auto-configures memsearch to use local embeddings on startup |
+| `use_daemon` | `boolean` | `true` | Whether to use a background daemon for faster search/index operations |
 
 ### Summarization model
 
@@ -179,47 +186,39 @@ To switch back to local mode:
 memsearch config set milvus.uri "~/.memsearch/milvus.db"
 ```
 
-### Embedding provider
+### Daemon mode
 
-By default, the plugin auto-configures memsearch to use **local embeddings** (`embedding.provider = local`). This is important because memsearch's own default is `openai`, which would require an API key and make network requests for every index and search operation.
+By default, the plugin starts a background daemon process that keeps the memsearch embedding model loaded in memory. This avoids the Python cold-start penalty (~5-10s) on every search, index, or expand operation — reducing latency to ~50ms.
 
-With local embeddings, the `all-MiniLM-L6-v2` model runs on your machine — no API calls needed for vector search.
+The daemon:
+- Starts automatically on session creation
+- Listens on a Unix domain socket at `.memsearch/daemon.sock`
+- Falls back to the CLI transparently if the daemon is unavailable
+- Writes logs to `.memsearch/daemon.log`
+- Stores its PID in `.memsearch/daemon.pid`
 
-To manage the embedding provider yourself (e.g., to use OpenAI embeddings or a custom endpoint), disable auto-configuration:
+To disable the daemon and use the CLI for all operations:
 
 ```json
 {
-  "auto_configure_embedding": false
+  "use_daemon": false
 }
 ```
 
 Or via environment variable:
 
 ```bash
-export MEMSEARCH_AUTO_CONFIGURE_EMBEDDING=false
+export MEMSEARCH_USE_DAEMON=false
 ```
 
-Then configure memsearch directly:
-
-```bash
-# Example: use OpenAI embeddings
-memsearch config set embedding.provider openai
-memsearch config set embedding.api_key "env:OPENAI_API_KEY"
-
-# Example: use a custom OpenAI-compatible endpoint
-memsearch config set embedding.provider openai
-memsearch config set embedding.base_url http://localhost:11434/v1
-memsearch config set embedding.model nomic-embed-text
-```
-
-See the [memsearch documentation](https://github.com/nicobako/memsearch) for all available embedding options.
+The daemon is most beneficial on machines where Python startup is slow (older hardware, CPU-only inference). On fast machines with NVMe storage, the difference may be negligible.
 
 ### Environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `MEMSEARCH_SUMMARIZATION_MODEL` | Override the model used for summarization (takes precedence over config file) |
-| `MEMSEARCH_AUTO_CONFIGURE_EMBEDDING` | Set to `false` or `0` to disable automatic local embedding configuration |
+| `MEMSEARCH_USE_DAEMON` | Set to `false` or `0` to disable the background daemon (uses CLI for all operations) |
 | `MEMSEARCH_DISABLE` | Set to any value to disable the plugin entirely (used internally to prevent recursion during summarization) |
 
 ### Precedence

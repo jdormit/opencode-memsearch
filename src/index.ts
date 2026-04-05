@@ -1,16 +1,18 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import { createHash } from "crypto"
-import { readdir, readFile, appendFile, mkdir, writeFile, unlink } from "fs/promises"
-import { join, basename, resolve } from "path"
+import { readdir, readFile, appendFile, mkdir, writeFile, unlink, access } from "fs/promises"
+import { join, basename, resolve, dirname } from "path"
 import { tmpdir, homedir } from "os"
+import { createConnection } from "net"
+import { fileURLToPath } from "url"
 
 // --- Configuration ---
 
 interface PluginConfig {
   /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
   summarization_model?: string
-  /** Whether to auto-configure memsearch to use local embeddings (default: true) */
-  auto_configure_embedding?: boolean
+  /** Whether to use the daemon for faster search/index (default: true) */
+  use_daemon?: boolean
 }
 
 const DEFAULT_SUMMARIZATION_MODEL = "anthropic/claude-haiku-4-5"
@@ -40,12 +42,12 @@ function getSummarizationModel(config: PluginConfig): string {
   )
 }
 
-function shouldAutoConfigureEmbedding(config: PluginConfig): boolean {
-  const envVal = process.env.MEMSEARCH_AUTO_CONFIGURE_EMBEDDING
+function shouldUseDaemon(config: PluginConfig): boolean {
+  const envVal = process.env.MEMSEARCH_USE_DAEMON
   if (envVal !== undefined) {
     return envVal !== "0" && envVal.toLowerCase() !== "false"
   }
-  return config.auto_configure_embedding !== false
+  return config.use_daemon !== false
 }
 
 // --- Helpers ---
@@ -94,16 +96,94 @@ Rules:
 
 const TEMP_DIR = join(tmpdir(), "memsearch-plugin")
 
+// --- Daemon communication ---
+
+/** Path to the daemon Python script, shipped alongside the built plugin. */
+function getDaemonScriptPath(): string {
+  // In the npm package, scripts/ is a sibling of dist/
+  // __dirname (or import.meta equivalent) points to dist/
+  const thisDir = typeof __dirname !== "undefined"
+    ? __dirname
+    : dirname(fileURLToPath(import.meta.url))
+  return join(thisDir, "..", "scripts", "memsearch-daemon.py")
+}
+
+function getDaemonSocketPath(memsearchDir: string): string {
+  return join(memsearchDir, "daemon.sock")
+}
+
+function getDaemonPidPath(memsearchDir: string): string {
+  return join(memsearchDir, "daemon.pid")
+}
+
+/**
+ * Send a JSON request to the daemon over its Unix socket.
+ * Returns the parsed response, or null if the daemon is unreachable.
+ */
+function daemonRequest(
+  socketPath: string,
+  request: Record<string, unknown>,
+  timeoutMs: number = 30000,
+): Promise<Record<string, unknown> | null> {
+  return new Promise((resolve) => {
+    let responded = false
+    const chunks: Buffer[] = []
+
+    const timer = setTimeout(() => {
+      if (!responded) {
+        responded = true
+        sock.destroy()
+        resolve(null)
+      }
+    }, timeoutMs)
+
+    const sock = createConnection({ path: socketPath }, () => {
+      sock.end(JSON.stringify(request))
+    })
+
+    sock.on("data", (chunk: Buffer | string) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    })
+
+    sock.on("end", () => {
+      if (responded) return
+      responded = true
+      clearTimeout(timer)
+      try {
+        const data = Buffer.concat(chunks).toString("utf-8")
+        resolve(JSON.parse(data))
+      } catch {
+        resolve(null)
+      }
+    })
+
+    sock.on("error", () => {
+      if (responded) return
+      responded = true
+      clearTimeout(timer)
+      resolve(null)
+    })
+  })
+}
+
+/** Check if the daemon is alive by sending a ping. */
+async function isDaemonAlive(socketPath: string): Promise<boolean> {
+  const resp = await daemonRequest(socketPath, { cmd: "ping" }, 5000)
+  return resp?.ok === true
+}
+
 // --- Session state tracking ---
 
 interface SessionState {
   directory: string
   memoryDir: string
+  memsearchDir: string
   collectionName: string
   coldStartContext?: string
   isSummarizing: boolean
   lastSummarizedMessageCount: number
   headingWritten: boolean
+  daemonReady: boolean
 }
 
 // --- Plugin ---
@@ -118,16 +198,55 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
 
   // Detect memsearch binary
   let memsearchCmd: string[] | null = null
+  let memsearchPythonPath: string | null = null
 
   async function detectMemsearch(): Promise<string[] | null> {
     try {
       await $`which memsearch`.quiet()
       return ["memsearch"]
     } catch {}
+    return null
+  }
+
+  /**
+   * Find the Python interpreter that has memsearch available (for the daemon).
+   *
+   * Strategy:
+   * 1. Read the shebang from the `memsearch` CLI script — this directly
+   *    points at the Python that memsearch was installed into, whether
+   *    that's a uv tool venv, a pip virtualenv, or system Python.
+   * 2. Fall back to probing system python3/python for `import memsearch`.
+   */
+  async function detectMemsearchPython(): Promise<string | null> {
+    if (memsearchPythonPath) return memsearchPythonPath
+
+    // Strategy 1: read the shebang from the memsearch CLI script
     try {
-      await $`which uvx`.quiet()
-      return ["uvx", "--from", "memsearch[local]", "memsearch"]
+      const memsearchBin = (await $`which memsearch`.quiet().text()).trim()
+      if (memsearchBin) {
+        const content = await readFile(memsearchBin, "utf-8")
+        const firstLine = content.split("\n")[0]
+        if (firstLine.startsWith("#!")) {
+          const shebangPath = firstLine.slice(2).trim()
+          // Verify this Python can actually import memsearch
+          try {
+            await $`${shebangPath} -c "import memsearch"`.quiet()
+            memsearchPythonPath = shebangPath
+            return shebangPath
+          } catch {}
+        }
+      }
     } catch {}
+
+    // Strategy 2: try system python
+    for (const py of ["python3", "python"]) {
+      try {
+        await $`${py} -c "import memsearch"`.quiet()
+        memsearchPythonPath = py
+        return py
+      } catch {}
+    }
+
     return null
   }
 
@@ -138,7 +257,7 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   }
 
   const MEMSEARCH_NOT_FOUND_ERROR =
-    "memsearch is not installed. Tell the user to install it by running: pip install 'memsearch[local]' — or, if they have uv: uv tool install 'memsearch[local]'. See https://github.com/jdormit/opencode-memsearch for details."
+    "memsearch is not installed. Tell the user to install it by running: uv tool install 'memsearch[onnx]' — or with pip: pip install 'memsearch[onnx]'. See https://github.com/jdormit/opencode-memsearch for details."
 
   async function runMemsearch(
     args: string[],
@@ -166,15 +285,161 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
     }
   }
 
-  async function configureLocalEmbedding(): Promise<void> {
-    const cmd = memsearchCmd
-    if (!cmd) return
-    const provider = await getMemsearchConfig("embedding.provider")
-    if (provider !== "local") {
-      try {
-        await $`${[...cmd, "config", "set", "embedding.provider", "local"]}`.quiet()
-      } catch {}
+  // --- Daemon lifecycle ---
+
+  async function startDaemon(
+    memsearchDir: string,
+    memoryDir: string,
+    collectionName: string,
+  ): Promise<boolean> {
+    const socketPath = getDaemonSocketPath(memsearchDir)
+    const pidPath = getDaemonPidPath(memsearchDir)
+
+    // Check if daemon is already running
+    if (await isDaemonAlive(socketPath)) {
+      return true
     }
+
+    // Clean up stale socket/pid
+    await stopDaemon(memsearchDir)
+
+    const pythonPath = await detectMemsearchPython()
+    if (!pythonPath) return false
+
+    const daemonScript = getDaemonScriptPath()
+    try {
+      await access(daemonScript)
+    } catch {
+      return false
+    }
+
+    try {
+      const logPath = join(memsearchDir, "daemon.log")
+      const proc = Bun.spawn(
+        [
+          pythonPath,
+          daemonScript,
+          "--socket", socketPath,
+          "--collection", collectionName,
+          "--paths", memoryDir,
+          "--pid-file", pidPath,
+        ],
+        {
+          stdout: Bun.file(logPath),
+          stderr: Bun.file(logPath),
+          stdin: "ignore",
+        },
+      )
+
+      // Don't await the process — it's a long-running daemon.
+      // But we do need to wait for it to be ready.
+      // Poll for the socket to appear and respond.
+      const startTime = Date.now()
+      const maxWaitMs = 60000 // 60s for first-time model download
+      while (Date.now() - startTime < maxWaitMs) {
+        await new Promise((r) => setTimeout(r, 500))
+        if (await isDaemonAlive(socketPath)) {
+          return true
+        }
+      }
+
+      // Timed out waiting for daemon
+      return false
+    } catch {
+      return false
+    }
+  }
+
+  async function stopDaemon(memsearchDir: string): Promise<void> {
+    const socketPath = getDaemonSocketPath(memsearchDir)
+    const pidPath = getDaemonPidPath(memsearchDir)
+
+    // Try graceful shutdown via socket
+    try {
+      await daemonRequest(socketPath, { cmd: "shutdown" }, 3000)
+    } catch {}
+
+    // Kill by PID if still alive
+    try {
+      const pidStr = await readFile(pidPath, "utf-8")
+      const pid = parseInt(pidStr.trim(), 10)
+      if (pid) {
+        try {
+          process.kill(pid)
+        } catch {}
+      }
+    } catch {}
+
+    // Clean up files
+    try { await unlink(socketPath) } catch {}
+    try { await unlink(pidPath) } catch {}
+  }
+
+  /**
+   * Run a memsearch operation, preferring the daemon if available.
+   * Falls back to the CLI transparently.
+   */
+  async function daemonSearch(
+    memsearchDir: string,
+    collectionName: string,
+    query: string,
+    topK: number,
+  ): Promise<string> {
+    const socketPath = getDaemonSocketPath(memsearchDir)
+    const resp = await daemonRequest(socketPath, {
+      cmd: "search",
+      query,
+      top_k: topK,
+    })
+
+    if (resp?.ok && Array.isArray(resp.results)) {
+      return JSON.stringify(resp.results, null, 2)
+    }
+
+    // Fallback to CLI
+    return runMemsearch(
+      ["search", query, "--top-k", String(topK), "--json-output"],
+      collectionName,
+    )
+  }
+
+  async function daemonExpand(
+    memsearchDir: string,
+    collectionName: string,
+    chunkHash: string,
+  ): Promise<string> {
+    const socketPath = getDaemonSocketPath(memsearchDir)
+    const resp = await daemonRequest(socketPath, {
+      cmd: "expand",
+      chunk_hash: chunkHash,
+    })
+
+    if (resp?.ok && resp.result) {
+      return JSON.stringify(resp.result, null, 2)
+    }
+
+    // Fallback to CLI
+    return runMemsearch(
+      ["expand", chunkHash, "--json-output"],
+      collectionName,
+    )
+  }
+
+  async function daemonIndex(
+    memsearchDir: string,
+    collectionName: string,
+    memoryDir: string,
+  ): Promise<void> {
+    const socketPath = getDaemonSocketPath(memsearchDir)
+    const resp = await daemonRequest(socketPath, {
+      cmd: "index",
+      paths: [memoryDir],
+    })
+
+    if (resp?.ok) return
+
+    // Fallback to CLI (fire and forget)
+    runMemsearch(["index", memoryDir], collectionName)
   }
 
   // Watch singleton management
@@ -414,10 +679,7 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   await ensureMemsearch()
   const pluginConfig = await loadConfig(directory)
   const summarizationModel = getSummarizationModel(pluginConfig)
-
-  if (memsearchCmd && shouldAutoConfigureEmbedding(pluginConfig)) {
-    await configureLocalEmbedding()
-  }
+  const useDaemon = shouldUseDaemon(pluginConfig)
 
   return {
     // Event handler for session lifecycle
@@ -447,23 +709,49 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
         sessions.set(sessionID, {
           directory: sessionDir,
           memoryDir,
+          memsearchDir,
           collectionName,
           isSummarizing: false,
           lastSummarizedMessageCount: 0,
           headingWritten: false,
+          daemonReady: false,
         })
 
-        // Start watch singleton (server mode only)
-        await startWatch(memoryDir, memsearchDir, collectionName)
+        // Start daemon (non-blocking — we poll for readiness in the background)
+        if (useDaemon && memsearchCmd) {
+          // Fire off daemon startup in background so it doesn't block session creation
+          startDaemon(memsearchDir, memoryDir, collectionName).then((ready) => {
+            const state = sessions.get(sessionID)
+            if (state) {
+              state.daemonReady = ready
+            }
+          })
+        }
 
-        // One-time index for Lite mode
-        const milvusUri = await getMemsearchConfig("milvus.uri")
-        if (
-          !milvusUri.startsWith("http") &&
-          !milvusUri.startsWith("tcp")
-        ) {
-          // Fire and forget
-          runMemsearch(["index", memoryDir], collectionName)
+        // Start watch singleton (server mode only, when not using daemon)
+        if (!useDaemon) {
+          await startWatch(memoryDir, memsearchDir, collectionName)
+        }
+
+        // One-time index for Lite mode (unless daemon handles it)
+        if (!useDaemon) {
+          const milvusUri = await getMemsearchConfig("milvus.uri")
+          if (
+            !milvusUri.startsWith("http") &&
+            !milvusUri.startsWith("tcp")
+          ) {
+            // Fire and forget
+            runMemsearch(["index", memoryDir], collectionName)
+          }
+        } else {
+          // When using daemon, the initial index will happen via the daemon
+          // once it's ready (it loads the paths on startup).
+          // But we also fire a daemon index request for safety.
+          const socketPath = getDaemonSocketPath(memsearchDir)
+          // Don't await — the daemon might not be ready yet. The first
+          // search/index call will succeed once it's up.
+          daemonRequest(socketPath, { cmd: "index", paths: [memoryDir] }, 30000)
+            .catch(() => {})
         }
 
         // Load cold-start context into session state for system prompt injection.
@@ -508,10 +796,12 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
             state = {
               directory: sessionDir,
               memoryDir,
+              memsearchDir,
               collectionName,
               isSummarizing: false,
               lastSummarizedMessageCount: 0,
               headingWritten: false,
+              daemonReady: false,
             }
             sessions.set(sessionID, state)
           } catch {
@@ -581,8 +871,12 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
           // Track that we've summarized up to this point
           state.lastSummarizedMessageCount = messages.length
 
-          // Re-index
-          runMemsearch(["index", state.memoryDir], state.collectionName)
+          // Re-index (prefer daemon, fall back to CLI)
+          if (useDaemon) {
+            daemonIndex(state.memsearchDir, state.collectionName, state.memoryDir)
+          } else {
+            runMemsearch(["index", state.memoryDir], state.collectionName)
+          }
         } catch {
           // Silently fail — memory capture is best-effort
         } finally {
@@ -614,12 +908,32 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
             return MEMSEARCH_NOT_FOUND_ERROR
           }
           const collectionName = deriveCollectionName(context.directory)
+          const memsearchDir = join(context.directory, ".memsearch")
+          const topK = args.top_k ?? 5
+
+          if (useDaemon) {
+            const raw = await daemonSearch(memsearchDir, collectionName, args.query, topK)
+            if (!raw.trim()) {
+              return "No results found."
+            }
+            try {
+              const results = JSON.parse(raw)
+              if (!Array.isArray(results) || results.length === 0) {
+                return "No results found."
+              }
+              return JSON.stringify(results, null, 2)
+            } catch {
+              return raw
+            }
+          }
+
+          // CLI path (no daemon)
           const raw = await runMemsearch(
             [
               "search",
               args.query,
               "--top-k",
-              String(args.top_k ?? 5),
+              String(topK),
               "--json-output",
             ],
             collectionName,
@@ -655,10 +969,18 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
             return MEMSEARCH_NOT_FOUND_ERROR
           }
           const collectionName = deriveCollectionName(context.directory)
-          const raw = await runMemsearch(
-            ["expand", args.chunk_hash, "--json-output"],
-            collectionName,
-          )
+          const memsearchDir = join(context.directory, ".memsearch")
+
+          let raw: string
+          if (useDaemon) {
+            raw = await daemonExpand(memsearchDir, collectionName, args.chunk_hash)
+          } else {
+            raw = await runMemsearch(
+              ["expand", args.chunk_hash, "--json-output"],
+              collectionName,
+            )
+          }
+
           if (!raw.trim()) {
             return "Chunk not found."
           }
