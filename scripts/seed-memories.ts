@@ -30,8 +30,6 @@ import {
 interface PluginConfig {
   /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
   summarization_model?: string
-  /** Whether to use the daemon for faster search/index (default: true) */
-  use_daemon?: boolean
 }
 
 const DEFAULT_SUMMARIZATION_MODEL = "anthropic/claude-haiku-4-5"
@@ -310,11 +308,6 @@ export async function seed(opts: { days: number }) {
   const memsearchCmd = await detectMemsearch()
   console.log(`Using memsearch: ${memsearchCmd.join(" ")}`)
 
-  // Load config from cwd (the project root the seed script is run from)
-  const config = await loadConfig(process.cwd())
-  const summarizationModel = getSummarizationModel(config)
-  console.log(`Summarization model: ${summarizationModel}`)
-
   await mkdir(TEMP_DIR, { recursive: true })
 
   // Open database (read-only)
@@ -339,8 +332,11 @@ export async function seed(opts: { days: number }) {
     }
 
     console.log(`Projects:`)
+    const summarizationModels = new Map<string, string>()
     for (const [dir, sessions] of byDir) {
-      console.log(`  ${dir} (${sessions.length} sessions)`)
+      const model = getSummarizationModel(await loadConfig(dir))
+      summarizationModels.set(dir, model)
+      console.log(`  ${dir} (${sessions.length} sessions, model: ${model})`)
     }
     console.log()
 
@@ -390,13 +386,21 @@ export async function seed(opts: { days: number }) {
       const sessionDate = formatDate(session.time_created)
       const sessionTime = formatTime(session.time_created)
       const memoryFile = join(memoryDir, `${sessionDate}.md`)
+      let existingMemory = ""
+      try {
+        existingMemory = await readFile(memoryFile, "utf-8")
+      } catch {}
 
-      // Write session heading
-      await appendFile(memoryFile, `\n## Session ${sessionTime} — ${session.title}\n\n`)
+      // Older versions used one session-only anchor per completed turn.
+      const legacyAnchor = `<!-- session:${session.id} -->`
+      const legacyTurnCount = existingMemory.split(legacyAnchor).length - 1
 
       // Process each turn
+      let headingWritten = legacyTurnCount > 0 || existingMemory.includes(`<!-- session:${session.id} turn:`)
       for (let turnIdx = 0; turnIdx < substantiveTurns.length; turnIdx++) {
         const turn = substantiveTurns[turnIdx]
+        const anchor = `<!-- session:${session.id} turn:${turnIdx} -->`
+        if (turnIdx < legacyTurnCount || existingMemory.includes(anchor)) continue
         totalTurns++
 
         const turnTime = turn[0].info.time?.created
@@ -410,7 +414,11 @@ export async function seed(opts: { days: number }) {
         const tempFile = join(TEMP_DIR, `turn-${sessionNum}-${turnIdx}.txt`)
         let summary = ""
         try {
-          summary = await summarizeWithOpencode(transcript, tempFile, summarizationModel)
+          summary = await summarizeWithOpencode(
+            transcript,
+            tempFile,
+            summarizationModels.get(sessionDir) || DEFAULT_SUMMARIZATION_MODEL,
+          )
           if (summary) totalSummarized++
         } catch {
           // LLM failed
@@ -422,8 +430,13 @@ export async function seed(opts: { days: number }) {
 
         if (!summary) continue
 
-        const entry = `### ${turnTime}\n<!-- session:${session.id} -->\n${summary}\n\n`
+        if (!headingWritten) {
+          await appendFile(memoryFile, `\n## Session ${sessionTime} — ${session.title}\n\n`)
+          headingWritten = true
+        }
+        const entry = `### ${turnTime}\n${anchor}\n${summary}\n\n`
         await appendFile(memoryFile, entry)
+        existingMemory += entry
 
         // Print progress on long sessions
         if (substantiveTurns.length > 5 && (turnIdx + 1) % 5 === 0) {
@@ -437,15 +450,24 @@ export async function seed(opts: { days: number }) {
     console.log()
 
     // Index all memory directories
+    let indexFailures = 0
     for (const [memDir, collectionName] of memoryDirs) {
       console.log(`Indexing ${memDir} (collection: ${collectionName})...`)
       try {
         const fullArgs = [...memsearchCmd, "index", memDir, "--collection", collectionName]
-        await $`${fullArgs}`.nothrow().quiet()
+        const result = await $`${fullArgs}`.nothrow().quiet()
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr.toString().trim() || `exit code ${result.exitCode}`)
+        }
         console.log(`  Done.`)
       } catch (err) {
         console.error(`  Failed to index: ${err}`)
+        indexFailures++
       }
+    }
+
+    if (indexFailures > 0) {
+      throw new Error(`Failed to index ${indexFailures} project${indexFailures === 1 ? "" : "s"}.`)
     }
 
     console.log()
@@ -458,5 +480,3 @@ export async function seed(opts: { days: number }) {
     } catch {}
   }
 }
-
-

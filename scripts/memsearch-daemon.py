@@ -219,10 +219,6 @@ async def main():
     ms = MemSearch(args.paths or None, **kwargs)
     logger.info("Model loaded.")
 
-    # Clean up stale socket
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
-
     # Ensure parent directory exists
     Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -253,10 +249,14 @@ async def main():
     await server.wait_closed()
     ms.close()
 
-    # Cleanup
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
+    # Only remove files that still belong to this daemon. A replacement may
+    # have started while this process was shutting down.
+    owns_files = False
     if args.pid_file and os.path.exists(args.pid_file):
+        owns_files = Path(args.pid_file).read_text().strip() == str(os.getpid())
+    if owns_files and os.path.exists(socket_path):
+        os.unlink(socket_path)
+    if owns_files and args.pid_file and os.path.exists(args.pid_file):
         os.unlink(args.pid_file)
 
 

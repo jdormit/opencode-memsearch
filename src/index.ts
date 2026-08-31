@@ -1,6 +1,6 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import { createHash } from "crypto"
-import { readdir, readFile, appendFile, mkdir, writeFile, unlink, access } from "fs/promises"
+import { readdir, readFile, appendFile, mkdir, writeFile, unlink, access, open } from "fs/promises"
 import { join, basename, resolve, dirname } from "path"
 import { tmpdir, homedir } from "os"
 import { createConnection } from "net"
@@ -11,8 +11,6 @@ import { fileURLToPath } from "url"
 interface PluginConfig {
   /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
   summarization_model?: string
-  /** Whether to use the daemon for faster search/index (default: true) */
-  use_daemon?: boolean
 }
 
 const DEFAULT_SUMMARIZATION_MODEL = "anthropic/claude-haiku-4-5"
@@ -40,14 +38,6 @@ function getSummarizationModel(config: PluginConfig): string {
     config.summarization_model ||
     DEFAULT_SUMMARIZATION_MODEL
   )
-}
-
-function shouldUseDaemon(config: PluginConfig): boolean {
-  const envVal = process.env.MEMSEARCH_USE_DAEMON
-  if (envVal !== undefined) {
-    return envVal !== "0" && envVal.toLowerCase() !== "false"
-  }
-  return config.use_daemon !== false
 }
 
 // --- Helpers ---
@@ -294,26 +284,43 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   ): Promise<boolean> {
     const socketPath = getDaemonSocketPath(memsearchDir)
     const pidPath = getDaemonPidPath(memsearchDir)
+    const lockPath = join(memsearchDir, "daemon.start.lock")
 
     // Check if daemon is already running
     if (await isDaemonAlive(socketPath)) {
       return true
     }
 
-    // Clean up stale socket/pid
-    await stopDaemon(memsearchDir)
-
-    const pythonPath = await detectMemsearchPython()
-    if (!pythonPath) return false
-
-    const daemonScript = getDaemonScriptPath()
+    let lock
     try {
-      await access(daemonScript)
+      lock = await open(lockPath, "wx")
     } catch {
+      const startTime = Date.now()
+      while (Date.now() - startTime < 60000) {
+        await new Promise((r) => setTimeout(r, 500))
+        if (await isDaemonAlive(socketPath)) return true
+      }
       return false
     }
 
     try {
+      // Another process may have completed startup before we acquired the lock.
+      if (await isDaemonAlive(socketPath)) return true
+
+      // Clean up stale socket/pid files. Do not signal an unverifiable PID:
+      // the operating system may have reused it for an unrelated process.
+      await stopDaemon(memsearchDir)
+
+      const pythonPath = await detectMemsearchPython()
+      if (!pythonPath) return false
+
+      const daemonScript = getDaemonScriptPath()
+      try {
+        await access(daemonScript)
+      } catch {
+        return false
+      }
+
       const logPath = join(memsearchDir, "daemon.log")
       const proc = Bun.spawn(
         [
@@ -344,9 +351,13 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
       }
 
       // Timed out waiting for daemon
+      proc.kill()
       return false
     } catch {
       return false
+    } finally {
+      await lock.close()
+      try { await unlink(lockPath) } catch {}
     }
   }
 
@@ -357,17 +368,6 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
     // Try graceful shutdown via socket
     try {
       await daemonRequest(socketPath, { cmd: "shutdown" }, 3000)
-    } catch {}
-
-    // Kill by PID if still alive
-    try {
-      const pidStr = await readFile(pidPath, "utf-8")
-      const pid = parseInt(pidStr.trim(), 10)
-      if (pid) {
-        try {
-          process.kill(pid)
-        } catch {}
-      }
     } catch {}
 
     // Clean up files
@@ -679,7 +679,9 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
   await ensureMemsearch()
   const pluginConfig = await loadConfig(directory)
   const summarizationModel = getSummarizationModel(pluginConfig)
-  const useDaemon = shouldUseDaemon(pluginConfig)
+  // Per-project daemons cannot safely share Milvus Lite's single database.
+  // Keep this path disabled until the daemon can route all collections.
+  const useDaemon = false
 
   return {
     // Event handler for session lifecycle
@@ -720,7 +722,21 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
         // Start daemon (non-blocking — we poll for readiness in the background)
         if (useDaemon && memsearchCmd) {
           // Fire off daemon startup in background so it doesn't block session creation
-          startDaemon(memsearchDir, memoryDir, collectionName).then((ready) => {
+          startDaemon(memsearchDir, memoryDir, collectionName).then(async (ready) => {
+            if (ready) {
+              const socketPath = getDaemonSocketPath(memsearchDir)
+              const response = await daemonRequest(
+                socketPath,
+                { cmd: "index", paths: [memoryDir] },
+                30000,
+              )
+              if (response?.ok !== true) {
+                ready = false
+              }
+            }
+            if (!ready) {
+              runMemsearch(["index", memoryDir], collectionName)
+            }
             const state = sessions.get(sessionID)
             if (state) {
               state.daemonReady = ready
@@ -730,6 +746,9 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
 
         // Start watch singleton (server mode only, when not using daemon)
         if (!useDaemon) {
+          // Clean up daemons created by pre-release source builds before using
+          // Milvus Lite through short-lived CLI processes.
+          await stopDaemon(memsearchDir)
           await startWatch(memoryDir, memsearchDir, collectionName)
         }
 
@@ -743,15 +762,6 @@ const memsearchPlugin: Plugin = async ({ client, $, directory }) => {
             // Fire and forget
             runMemsearch(["index", memoryDir], collectionName)
           }
-        } else {
-          // When using daemon, the initial index will happen via the daemon
-          // once it's ready (it loads the paths on startup).
-          // But we also fire a daemon index request for safety.
-          const socketPath = getDaemonSocketPath(memsearchDir)
-          // Don't await — the daemon might not be ready yet. The first
-          // search/index call will succeed once it's up.
-          daemonRequest(socketPath, { cmd: "index", paths: [memoryDir] }, 30000)
-            .catch(() => {})
         }
 
         // Load cold-start context into session state for system prompt injection.

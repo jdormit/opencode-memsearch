@@ -105,7 +105,10 @@ export async function reindex(opts: { dryRun: boolean }) {
       console.log(`${label}   Resetting collection ${t.collectionName}...`)
       try {
         const resetArgs = [...memsearchCmd, "reset", "--collection", t.collectionName, "--yes"]
-        await $`${resetArgs}`.nothrow().quiet()
+        const result = await $`${resetArgs}`.nothrow().quiet()
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr.toString().trim() || `exit code ${result.exitCode}`)
+        }
       } catch (err) {
         console.error(`${label}   Failed to reset: ${err}`)
         failed++
@@ -116,7 +119,11 @@ export async function reindex(opts: { dryRun: boolean }) {
       console.log(`${label}   Indexing ${t.memoryDir}...`)
       try {
         const indexArgs = [...memsearchCmd, "index", t.memoryDir, "--collection", t.collectionName, "--force"]
-        const output = await $`${indexArgs}`.nothrow().quiet().text()
+        const result = await $`${indexArgs}`.nothrow().quiet()
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr.toString().trim() || `exit code ${result.exitCode}`)
+        }
+        const output = result.stdout.toString()
         if (output.trim()) {
           console.log(`${label}   ${output.trim()}`)
         }
@@ -129,6 +136,9 @@ export async function reindex(opts: { dryRun: boolean }) {
 
     console.log()
     console.log(`Reindex complete: ${succeeded} succeeded, ${failed} failed.`)
+    if (failed > 0) {
+      throw new Error(`Failed to reindex ${failed} collection${failed === 1 ? "" : "s"}.`)
+    }
   } finally {
     db.close()
   }

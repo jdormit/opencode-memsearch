@@ -1,6 +1,6 @@
 {
   "name": "opencode-memsearch",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Persistent cross-session memory for OpenCode, powered by memsearch",
   "type": "module",
   "main": "dist/index.js",
@@ -16,7 +16,10 @@
   },
   "files": [
     "dist",
-    "scripts"
+    "scripts/cli.ts",
+    "scripts/lib.ts",
+    "scripts/reindex.ts",
+    "scripts/seed-memories.ts"
   ],
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target node --external @opencode-ai/plugin && tsc --emitDeclarationOnly",
