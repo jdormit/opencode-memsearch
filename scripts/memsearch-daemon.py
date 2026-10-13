@@ -1,41 +1,142 @@
 #!/usr/bin/env python3
 """
-memsearch-daemon — long-running process that keeps the embedding model loaded.
+memsearch-daemon — one long-running process shared by every OpenCode project.
 
-Serves search/index/expand requests over a Unix domain socket, avoiding the
-~8-11s Python+PyTorch cold-start penalty on every CLI invocation.
+It is the only process that opens the Milvus database, and it keeps the
+embedding model loaded so requests don't pay Python's cold-start cost.
 
-Protocol:
-  Client sends a JSON object (terminated by EOF/shutdown), daemon replies
-  with a JSON object.
+Protocol: the client sends one JSON object terminated by a newline (or EOF);
+the daemon replies with one JSON object and closes the connection.
 
 Commands:
-  {"cmd": "search", "query": "...", "top_k": 5, "source_prefix": null}
-  {"cmd": "index", "paths": ["..."], "force": false}
-  {"cmd": "expand", "chunk_hash": "..."}
+  {"cmd": "search", "collection": "...", "query": "...", "top_k": 5}
+  {"cmd": "index", "collection": "...", "paths": ["..."], "force": false}
+  {"cmd": "expand", "collection": "...", "chunk_hash": "..."}
+  {"cmd": "reset", "collection": "..."}
   {"cmd": "ping"}
   {"cmd": "shutdown"}
 
-Started by the opencode-memsearch plugin on session creation.
+Started by the opencode-memsearch plugin when no daemon is answering.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import re
 import signal
 import sys
+import time
 from pathlib import Path
+from typing import IO
+
+# Must match DAEMON_PROTOCOL in src/daemon-client.ts.
+PROTOCOL = 2
+MAX_REQUEST_BYTES = 1_048_576
+LOCK_WAIT_SECONDS = 10
+# Must match EXIT_LOCKED in src/daemon-client.ts.
+EXIT_LOCKED = 3
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [memsearch-daemon] %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("memsearch-daemon")
+
+
+def acquire_singleton_lock(pid_file: str) -> IO[str] | None:
+    """Hold an exclusive lock on the PID file for the daemon's lifetime.
+
+    Waits briefly so a replacement can start while an old daemon shuts down.
+    """
+    Path(pid_file).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    f = open(pid_file, "a+")
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() > deadline:
+                f.close()
+                return None
+            time.sleep(0.2)
+    f.seek(0)
+    f.truncate()
+    f.write(str(os.getpid()))
+    f.flush()
+    return f
+
+
+def share_embedding_provider() -> None:
+    """MemSearch builds its own embedder per instance. Reuse one per config so
+    each collection doesn't load another copy of the model."""
+    import memsearch.core as core
+
+    providers: dict = {}
+    load = core.get_provider
+
+    def get_provider(name, **kwargs):
+        key = (name, tuple(sorted(kwargs.items())))
+        if key not in providers:
+            providers[key] = load(name, **kwargs)
+        return providers[key]
+
+    core.get_provider = get_provider
+
+
+class Collections:
+    """One MemSearch instance per collection, created on first use.
+
+    Instances must stay open until shutdown: closing any one of them stops the
+    Milvus Lite server that all of them share.
+    """
+
+    def __init__(self, kwargs: dict, store_factory):
+        self._kwargs = kwargs
+        self._store_factory = store_factory
+        self._instances: dict = {}
+        self._index_locks: dict[str, asyncio.Lock] = {}
+
+    def get(self, name: str | None):
+        if not name:
+            raise ValueError("collection is required")
+        if name not in self._instances:
+            from memsearch.core import MemSearch
+
+            try:
+                self._instances[name] = MemSearch(None, collection=name, **self._kwargs)
+            except ValueError as e:
+                if "dimension mismatch" not in str(e).lower():
+                    raise
+                raise ValueError(
+                    f"Collection {name} was built with a different embedding model. "
+                    "Rebuild it with: bunx opencode-memsearch reindex"
+                ) from e
+        return self._instances[name]
+
+    def drop(self, name: str | None) -> None:
+        if not name:
+            raise ValueError("collection is required")
+        ms = self._instances.pop(name, None)
+        # A read-only store, because opening a MemSearch fails on the dimension
+        # mismatch that resetting is meant to fix.
+        store = ms.store if ms else self._store_factory(name)
+        store.drop()
+
+    def index_lock(self, name: str) -> asyncio.Lock:
+        return self._index_locks.setdefault(name, asyncio.Lock())
+
+    def close(self) -> None:
+        for ms in self._instances.values():
+            try:
+                ms.close()
+            except Exception:
+                logger.exception("Failed to close collection")
 
 
 def _extract_section(
@@ -68,25 +169,33 @@ def _extract_section(
     return content, section_start + 1, section_end
 
 
-async def handle_search(ms, params: dict) -> dict:
-    query = params.get("query", "")
-    top_k = params.get("top_k", 5)
-    source_prefix = params.get("source_prefix")
-    results = await ms.search(query, top_k=top_k, source_prefix=source_prefix)
+async def handle_search(collections: Collections, params: dict) -> dict:
+    ms = collections.get(params.get("collection"))
+    # Milvus rejects BM25 searches on an empty collection.
+    if ms.store.count() == 0:
+        return {"ok": True, "results": []}
+    results = await ms.search(
+        params.get("query", ""),
+        top_k=params.get("top_k", 5),
+        source_prefix=params.get("source_prefix"),
+    )
     return {"ok": True, "results": results}
 
 
-async def handle_index(ms, params: dict) -> dict:
-    paths = params.get("paths", [])
-    force = params.get("force", False)
-    if paths:
-        ms._paths = [str(p) for p in paths]
-    count = await ms.index(force=force)
+async def handle_index(collections: Collections, params: dict) -> dict:
+    name = params.get("collection")
+    async with collections.index_lock(name):
+        ms = collections.get(name)
+        paths = params.get("paths", [])
+        if paths:
+            ms._paths = [str(p) for p in paths]
+        count = await ms.index(force=params.get("force", False))
     return {"ok": True, "indexed": count}
 
 
-async def handle_expand(ms, params: dict) -> dict:
+async def handle_expand(collections: Collections, params: dict) -> dict:
     """Expand a chunk — mirrors the CLI expand command's --json-output."""
+    ms = collections.get(params.get("collection"))
     chunk_hash = params.get("chunk_hash", "")
     if not chunk_hash:
         return {"ok": False, "error": "chunk_hash is required"}
@@ -104,7 +213,6 @@ async def handle_expand(ms, params: dict) -> dict:
 
     source_path = Path(source)
     if not source_path.exists():
-        # Fall back to just returning the stored content
         return {
             "ok": True,
             "result": {
@@ -144,37 +252,49 @@ async def handle_expand(ms, params: dict) -> dict:
     return {"ok": True, "result": result}
 
 
-async def handle_client(reader, writer, ms, shutdown_event):
+async def handle_reset(collections: Collections, params: dict) -> dict:
+    name = params.get("collection")
+    async with collections.index_lock(name):
+        collections.drop(name)
+    return {"ok": True}
+
+
+HANDLERS = {
+    "search": handle_search,
+    "index": handle_index,
+    "expand": handle_expand,
+    "reset": handle_reset,
+}
+
+
+async def respond(request: dict, collections, shutdown_event, version: str) -> dict:
+    cmd = request.get("cmd")
+    if cmd in HANDLERS:
+        return await HANDLERS[cmd](collections, request)
+    if cmd == "ping":
+        return {"ok": True, "protocol": PROTOCOL, "version": version, "pid": os.getpid()}
+    if cmd == "shutdown":
+        shutdown_event.set()
+        return {"ok": True}
+    return {"ok": False, "error": f"Unknown command: {cmd}"}
+
+
+async def handle_client(reader, writer, collections, shutdown_event, version):
     try:
-        data = await reader.read(1_048_576)  # 1MB max request
-        if not data:
-            return
-
-        request = json.loads(data.decode("utf-8"))
-        cmd = request.get("cmd")
-
-        if cmd == "search":
-            response = await handle_search(ms, request)
-        elif cmd == "index":
-            response = await handle_index(ms, request)
-        elif cmd == "expand":
-            response = await handle_expand(ms, request)
-        elif cmd == "ping":
-            response = {"ok": True, "msg": "pong"}
-        elif cmd == "shutdown":
-            response = {"ok": True, "msg": "shutting down"}
-            shutdown_event.set()
-        else:
-            response = {"ok": False, "error": f"Unknown command: {cmd}"}
+        try:
+            data = await reader.readline()
+            if not data:
+                return
+            request = json.loads(data.decode("utf-8"))
+            response = await respond(request, collections, shutdown_event, version)
+        except Exception as e:
+            logger.exception("Request failed")
+            response = {"ok": False, "error": str(e)}
 
         writer.write(json.dumps(response, default=str).encode("utf-8"))
         await writer.drain()
-    except Exception as e:
-        try:
-            writer.write(json.dumps({"ok": False, "error": str(e)}).encode("utf-8"))
-            await writer.drain()
-        except Exception:
-            pass
+    except Exception:
+        logger.exception("Failed to send response")
     finally:
         writer.close()
         try:
@@ -188,76 +308,87 @@ async def main():
 
     parser = argparse.ArgumentParser(description="memsearch daemon")
     parser.add_argument("--socket", required=True, help="Unix socket path")
-    parser.add_argument("--collection", default=None, help="Milvus collection name")
-    parser.add_argument("--paths", nargs="*", default=[], help="Paths to index")
-    parser.add_argument("--pid-file", default=None, help="Write PID to this file")
+    parser.add_argument("--pid-file", required=True, help="PID file, also used as the singleton lock")
+    parser.add_argument("--version", default="0", help="Plugin version, reported by ping")
     args = parser.parse_args()
 
-    socket_path = args.socket
+    lock = acquire_singleton_lock(args.pid_file)
+    if lock is None:
+        logger.info("Another daemon holds %s; exiting", args.pid_file)
+        sys.exit(EXIT_LOCKED)
 
-    # Import memsearch (this is the slow part — loads PyTorch + model)
     from memsearch.config import resolve_config
-    from memsearch.core import MemSearch
+    from memsearch.store import MilvusStore
+
+    share_embedding_provider()
+    import memsearch.core as core
 
     cfg = resolve_config()
-
-    kwargs: dict = {
-        "embedding_provider": cfg.embedding.provider,
-        "embedding_model": cfg.embedding.model or None,
-        "embedding_batch_size": cfg.embedding.batch_size,
-        "embedding_base_url": cfg.embedding.base_url or None,
-        "embedding_api_key": cfg.embedding.api_key or None,
-        "milvus_uri": cfg.milvus.uri,
-        "milvus_token": cfg.milvus.token or None,
-        "collection": args.collection or cfg.milvus.collection,
-        "max_chunk_size": cfg.chunking.max_chunk_size,
-        "overlap_lines": cfg.chunking.overlap_lines,
-        "reranker_model": cfg.reranker.model,
+    embedding = {
+        "model": cfg.embedding.model or None,
+        "batch_size": cfg.embedding.batch_size,
+        "base_url": cfg.embedding.base_url or None,
+        "api_key": cfg.embedding.api_key or None,
     }
 
+    def read_only_store(collection: str):
+        return MilvusStore(
+            uri=cfg.milvus.uri,
+            token=cfg.milvus.token or None,
+            collection=collection,
+            dimension=None,
+        )
+
+    # Open the database before the slow model load, so a locked or broken
+    # database fails startup quickly instead of failing every later request.
+    probe = read_only_store("memsearch_daemon_probe")
+
     logger.info("Loading embedding model...")
-    ms = MemSearch(args.paths or None, **kwargs)
-    logger.info("Model loaded.")
+    core.get_provider(cfg.embedding.provider, **embedding)
+    logger.info("Ready.")
 
-    # Ensure parent directory exists
-    Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
-
-    shutdown_event = asyncio.Event()
-
-    server = await asyncio.start_unix_server(
-        lambda r, w: handle_client(r, w, ms, shutdown_event),
-        path=socket_path,
+    collections = Collections(
+        {
+            "embedding_provider": cfg.embedding.provider,
+            "embedding_model": embedding["model"],
+            "embedding_batch_size": embedding["batch_size"],
+            "embedding_base_url": embedding["base_url"],
+            "embedding_api_key": embedding["api_key"],
+            "milvus_uri": cfg.milvus.uri,
+            "milvus_token": cfg.milvus.token or None,
+            "max_chunk_size": cfg.chunking.max_chunk_size,
+            "overlap_lines": cfg.chunking.overlap_lines,
+            "reranker_model": cfg.reranker.model,
+        },
+        read_only_store,
     )
 
-    # Write PID file
-    if args.pid_file:
-        Path(args.pid_file).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.pid_file).write_text(str(os.getpid()))
+    socket_path = args.socket
+    Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
 
+    shutdown_event = asyncio.Event()
+    server = await asyncio.start_unix_server(
+        lambda r, w: handle_client(r, w, collections, shutdown_event, args.version),
+        path=socket_path,
+        limit=MAX_REQUEST_BYTES,
+    )
     logger.info("Listening on %s (PID %d)", socket_path, os.getpid())
 
-    # Handle SIGTERM gracefully
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, shutdown_event.set)
 
-    # Wait for shutdown signal
     await shutdown_event.wait()
     logger.info("Shutting down...")
 
     server.close()
     await server.wait_closed()
-    ms.close()
-
-    # Only remove files that still belong to this daemon. A replacement may
-    # have started while this process was shutting down.
-    owns_files = False
-    if args.pid_file and os.path.exists(args.pid_file):
-        owns_files = Path(args.pid_file).read_text().strip() == str(os.getpid())
-    if owns_files and os.path.exists(socket_path):
-        os.unlink(socket_path)
-    if owns_files and args.pid_file and os.path.exists(args.pid_file):
-        os.unlink(args.pid_file)
+    collections.close()
+    probe.close()
+    # Safe while we still hold the lock: no other daemon can own this socket yet.
+    Path(socket_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
@@ -265,3 +396,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except Exception:
+        logger.exception("Daemon failed")
+        sys.exit(1)

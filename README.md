@@ -11,6 +11,7 @@ This plugin gives your OpenCode agent long-term memory. It automatically summari
 - **Semantic search** — two custom tools (`memsearch_search` and `memsearch_expand`) let the agent search and drill into past memories
 - **Per-project isolation** — memory collections are scoped by project directory
 - **Local embeddings** — works with memsearch's ONNX or local embedding providers, so no API keys are needed for vector search
+- **Fast search** — a shared background [daemon](#daemon) keeps the embedding model loaded
 - **Memory protocol** — a system prompt directive instructs the agent to check memory at session start and whenever it encounters a topic that might have prior context
 
 ## Prerequisites
@@ -171,24 +172,40 @@ The plugin uses [Milvus](https://milvus.io/) (via memsearch) as its vector datab
 
 #### Local mode (default)
 
-By default, memsearch uses **Milvus Lite**, which stores data in a local `.db` file (typically `~/.memsearch/milvus.db`). This requires no server setup — it just works.
-
-In local mode, the plugin re-indexes the memory directory on session start (to pick up any memories written since the last session) and again after each new summary is appended. File locking prevents concurrent access issues, so no background watcher is needed.
+By default, memsearch uses **Milvus Lite**, which stores data in a local `.db` file (typically `~/.memsearch/milvus.db`). This requires no server setup.
 
 #### Remote mode
 
-For concurrent access from multiple sessions or machines, you can point memsearch at a remote Milvus server:
+To share memory across machines, you can point memsearch at a remote Milvus server:
 
 ```bash
 memsearch config set milvus.uri http://localhost:19530
 ```
 
-In remote mode, the plugin starts a **file watcher** process that continuously re-indexes memory files whenever they change. The watcher runs as a background process with its PID stored in `.memsearch/.watch.pid`.
-
 To switch back to local mode:
 
 ```bash
 memsearch config set milvus.uri "~/.memsearch/milvus.db"
+```
+
+### Daemon
+
+All database access goes through one background daemon shared by every OpenCode session and project on the machine. Milvus Lite allows only one process to open its database, and the daemon also keeps the embedding model loaded, so searches take milliseconds instead of several seconds.
+
+The plugin starts the daemon on first use and replaces it if it is from an incompatible plugin version. It keeps running after OpenCode exits. Its files live in `~/.memsearch/daemon/`:
+
+- `daemon.sock` — the Unix socket the plugin connects to
+- `daemon.pid` — the daemon's PID, locked while it runs so only one daemon can start
+- `daemon.log` — startup errors and indexing failures
+
+The daemon reads memsearch's global config (`~/.memsearch/config.toml`). Project-level `.memsearch.toml` files are not used.
+
+The `seed` and `reindex` commands also index through the daemon. `reindex` restarts it first so it picks up changes to the embedding config.
+
+In local mode, the `memsearch` CLI can't open the database while the daemon is running. To use the CLI directly, stop the daemon first:
+
+```bash
+pkill -f memsearch-daemon.py
 ```
 
 ### Environment variables

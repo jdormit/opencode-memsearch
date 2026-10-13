@@ -17,14 +17,16 @@
 import { Database } from "bun:sqlite"
 import { readdir } from "fs/promises"
 import { join } from "path"
-import { $ } from "bun"
 
 import {
   DB_PATH,
   deriveCollectionName,
   detectMemsearch,
   listDistinctDirectories,
+  callPluginDaemon,
+  startPluginDaemon,
 } from "./lib"
+import { shutdownDaemon } from "../src/daemon-client"
 
 // --- Helpers ---
 
@@ -47,8 +49,7 @@ export async function reindex(opts: { dryRun: boolean }) {
   }
 
   // Setup
-  const memsearchCmd = await detectMemsearch()
-  console.log(`Using memsearch: ${memsearchCmd.join(" ")}`)
+  await detectMemsearch()
 
   // Open database (read-only)
   const db = new Database(DB_PATH, { readonly: true })
@@ -91,7 +92,10 @@ export async function reindex(opts: { dryRun: boolean }) {
       return
     }
 
-    // Reset and reindex each collection
+    // Restart the daemon so it picks up the current embedding config.
+    await shutdownDaemon()
+    const daemon = await startPluginDaemon()
+
     let succeeded = 0
     let failed = 0
 
@@ -100,36 +104,21 @@ export async function reindex(opts: { dryRun: boolean }) {
       const label = `[${i + 1}/${targets.length}]`
 
       console.log(`${label} ${t.directory}`)
-
-      // Reset the collection
-      console.log(`${label}   Resetting collection ${t.collectionName}...`)
       try {
-        const resetArgs = [...memsearchCmd, "reset", "--collection", t.collectionName, "--yes"]
-        const result = await $`${resetArgs}`.nothrow().quiet()
-        if (result.exitCode !== 0) {
-          throw new Error(result.stderr.toString().trim() || `exit code ${result.exitCode}`)
-        }
-      } catch (err) {
-        console.error(`${label}   Failed to reset: ${err}`)
-        failed++
-        continue
-      }
+        console.log(`${label}   Resetting collection ${t.collectionName}...`)
+        await callPluginDaemon(daemon, { cmd: "reset", collection: t.collectionName })
 
-      // Re-index the memory files
-      console.log(`${label}   Indexing ${t.memoryDir}...`)
-      try {
-        const indexArgs = [...memsearchCmd, "index", t.memoryDir, "--collection", t.collectionName, "--force"]
-        const result = await $`${indexArgs}`.nothrow().quiet()
-        if (result.exitCode !== 0) {
-          throw new Error(result.stderr.toString().trim() || `exit code ${result.exitCode}`)
-        }
-        const output = result.stdout.toString()
-        if (output.trim()) {
-          console.log(`${label}   ${output.trim()}`)
-        }
+        console.log(`${label}   Indexing ${t.memoryDir}...`)
+        const resp = await callPluginDaemon(daemon, {
+          cmd: "index",
+          collection: t.collectionName,
+          paths: [t.memoryDir],
+          force: true,
+        })
+        console.log(`${label}   Indexed ${resp.indexed} chunks.`)
         succeeded++
       } catch (err) {
-        console.error(`${label}   Failed to index: ${err}`)
+        console.error(`${label}   Failed: ${err}`)
         failed++
       }
     }

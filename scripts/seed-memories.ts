@@ -23,6 +23,8 @@ import {
   deriveCollectionName,
   detectMemsearch,
   listSessionsFromDb,
+  callPluginDaemon,
+  startPluginDaemon,
 } from "./lib"
 
 // --- Configuration ---
@@ -305,8 +307,7 @@ export async function seed(opts: { days: number }) {
   console.log()
 
   // Setup
-  const memsearchCmd = await detectMemsearch()
-  console.log(`Using memsearch: ${memsearchCmd.join(" ")}`)
+  await detectMemsearch()
 
   await mkdir(TEMP_DIR, { recursive: true })
 
@@ -450,15 +451,12 @@ export async function seed(opts: { days: number }) {
     console.log()
 
     // Index all memory directories
+    const daemon = await startPluginDaemon()
     let indexFailures = 0
     for (const [memDir, collectionName] of memoryDirs) {
       console.log(`Indexing ${memDir} (collection: ${collectionName})...`)
       try {
-        const fullArgs = [...memsearchCmd, "index", memDir, "--collection", collectionName]
-        const result = await $`${fullArgs}`.nothrow().quiet()
-        if (result.exitCode !== 0) {
-          throw new Error(result.stderr.toString().trim() || `exit code ${result.exitCode}`)
-        }
+        await callPluginDaemon(daemon, { cmd: "index", collection: collectionName, paths: [memDir] })
         console.log(`  Done.`)
       } catch (err) {
         console.error(`  Failed to index: ${err}`)

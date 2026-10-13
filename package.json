@@ -16,15 +16,18 @@
   },
   "files": [
     "dist",
+    "src/daemon-client.ts",
     "scripts/cli.ts",
     "scripts/lib.ts",
+    "scripts/memsearch-daemon.py",
     "scripts/reindex.ts",
     "scripts/seed-memories.ts"
   ],
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target node --external @opencode-ai/plugin && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "bun test"
   },
   "keywords": [
     "opencode",
