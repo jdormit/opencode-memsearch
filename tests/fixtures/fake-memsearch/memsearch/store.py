@@ -11,6 +11,9 @@ class MilvusStore:
         self.collection = collection
 
     def query(self, filter_expr=""):
+        source = os.environ.get("FAKE_MEMSEARCH_CHUNK_SOURCE")
+        if source and '"fixture-chunk"' in filter_expr:
+            return [{"source": source, "start_line": 1, "end_line": 4, "heading_level": 1, "heading": "Fixture memory"}]
         return []
 
     def count(self):

@@ -1,3 +1,5 @@
+import os
+
 from .events import record
 from .store import MilvusStore
 
@@ -37,6 +39,8 @@ class MemSearch:
         return self._store
 
     async def search(self, query, *, top_k=10, source_prefix=None):
+        if os.environ.get("FAKE_MEMSEARCH_CHUNK_SOURCE"):
+            return [{"collection": self._store.collection, "query": query, "top_k": top_k, "chunk_hash": "fixture-chunk"}]
         return [{"collection": self._store.collection, "query": query, "top_k": top_k}]
 
     async def index(self, *, force=False):

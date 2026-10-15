@@ -23,8 +23,8 @@ import {
 
 const MEMORY_PROTOCOL = `MEMORY PROTOCOL:
 1. Check the <memsearch-context> in the system prompt for recent memory from past sessions.
-2. ALWAYS use the memsearch_search tool to search for relevant memories before starting work in a session. The injected context only contains the last 30 lines of the 2 most recent memory files — it is not comprehensive. Search whenever you encounter a topic that might have prior context: past decisions, debugging sessions, user preferences, or earlier work on the same files or features.
-3. Use memsearch_expand to get full context for relevant search results and guidance on the original session.
+2. ALWAYS search for relevant memories before starting work in a session. The injected context only contains the last 30 lines of the 2 most recent memory files — it is not comprehensive. Search whenever you encounter a topic that might have prior context: past decisions, debugging sessions, user preferences, or earlier work on the same files or features.
+3. Memory tools use Code Mode. Find memsearch_search and memsearch_expand in the catalog (use search discovery if needed), then call their exact catalog paths through execute. They are not direct model tools. Await and return the results: for example, execute({code: 'return await tools.memsearch_search({query: "topic to recall"})'}). Search returns {results, content, error?}; use a result's chunk_hash with tools.memsearch_expand to get full context and guidance on the original session. Expand returns {result?, sessionIDs, content, error?}. Check error before using results. Preserve content when presenting or retaining the full notes and guidance.
 4. Memories are automatically recorded as you work — you do not need to write them manually.`
 
 async function recentMemory(directory: string): Promise<string> {
@@ -121,18 +121,28 @@ export default Plugin.define({
           required: ["query"],
           additionalProperties: false,
         },
+        output: {
+          type: "object",
+          properties: {
+            results: { type: "array", items: { type: "object", additionalProperties: true } },
+            content: { type: "string" },
+            error: { type: "string" },
+          },
+          required: ["results", "content"],
+          additionalProperties: false,
+        },
         async execute(value) {
           const input = value as { query: string; top_k?: number }
           const response = await callDaemon({
             cmd: "search", collection, query: input.query, top_k: input.top_k ?? 5,
           })
-          if (!response?.ok) return { content: failure(response) }
-          const results = response.results
-          return {
-            content: Array.isArray(results) && results.length
-              ? JSON.stringify(results, null, 2)
-              : "No results found.",
+          if (!response?.ok) {
+            const content = failure(response)
+            return { content, output: { results: [], content, error: content } }
           }
+          const results = Array.isArray(response.results) ? response.results : []
+          const content = results.length ? JSON.stringify(results, null, 2) : "No results found."
+          return { content, output: { results, content } }
         },
       })
       editor.add({
@@ -144,10 +154,24 @@ export default Plugin.define({
           required: ["chunk_hash"],
           additionalProperties: false,
         },
+        output: {
+          type: "object",
+          properties: {
+            result: { type: "object", additionalProperties: true },
+            sessionIDs: { type: "array", items: { type: "string" } },
+            content: { type: "string" },
+            error: { type: "string" },
+          },
+          required: ["sessionIDs", "content"],
+          additionalProperties: false,
+        },
         async execute(value) {
           const input = value as { chunk_hash: string }
           const response = await callDaemon({ cmd: "expand", collection, chunk_hash: input.chunk_hash })
-          if (!response?.ok) return { content: failure(response) }
+          if (!response?.ok) {
+            const content = failure(response)
+            return { content, output: { sessionIDs: [], content, error: content } }
+          }
           const result = response.result as { content?: string; source?: string; start_line?: number; end_line?: number }
           const content = result.content || ""
           const matches = content.matchAll(/<!-- session:([^\s>]+)(?:\s+turn:[^>]+)? -->/g)
@@ -160,7 +184,8 @@ export default Plugin.define({
             )
           }
           if (sessions.length) lines.push(`Session IDs found: ${sessions.join(", ")}`)
-          return { content: lines.join("\n") }
+          const text = lines.join("\n")
+          return { content: text, output: { result, sessionIDs: sessions, content: text } }
         },
       })
     })

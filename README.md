@@ -96,6 +96,16 @@ The agent can also search memories on demand:
 - **`memsearch_search`** — semantic search across all past memory chunks. Returns ranked results with content previews and chunk hashes.
 - **`memsearch_expand`** — expand a specific chunk to see full context, source file location, and session IDs for deeper investigation.
 
+Both tools are exposed through V2 Code Mode. Use the catalog (or search discovery) to find their exact paths, then call them inside `execute`:
+
+```js
+const memory = await tools.memsearch_search({ query: "previous deployment decision" })
+if (memory.error) return memory.content
+return memory.results
+```
+
+The catalog paths are `tools.memsearch_search` and `tools.memsearch_expand`. They are not direct model tools. Search returns `{results, content, error?}`; expand returns `{result?, sessionIDs, content, error?}`. The `content` field preserves the text notes and expansion guidance, while the structured fields let code select results and pass a `chunk_hash` into expand.
+
 ### Storage
 
 Memory data is stored per-project in `.memsearch/`:
