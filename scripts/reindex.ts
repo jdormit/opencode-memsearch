@@ -8,21 +8,20 @@
  * files are the source of truth; this command just rebuilds the vector index from them.
  *
  * What it does:
- * 1. Discovers all project directories from the OpenCode SQLite database
+ * 1. Discovers all project directories through the OpenCode 2 service
  * 2. For each project with existing .memsearch/memory/ files:
  *    a. Resets the memsearch collection (drops the old vector data)
  *    b. Re-indexes the memory markdown files with the current embedding provider
  */
 
-import { Database } from "bun:sqlite"
 import { readdir } from "fs/promises"
 import { join } from "path"
 
 import {
-  DB_PATH,
+  connect,
+  listSessions,
   deriveCollectionName,
   detectMemsearch,
-  listDistinctDirectories,
   callPluginDaemon,
   startPluginDaemon,
 } from "./lib"
@@ -51,13 +50,11 @@ export async function reindex(opts: { dryRun: boolean }) {
   // Setup
   await detectMemsearch()
 
-  // Open database (read-only)
-  const db = new Database(DB_PATH, { readonly: true })
-
-  try {
+  const client = await connect(true)
+  {
     // Discover all project directories
-    const allDirs = listDistinctDirectories(db)
-    console.log(`Found ${allDirs.length} project directories in the OpenCode database.`)
+    const allDirs = [...new Set((await listSessions(client)).filter((s) => !s.parentID).map((s) => s.location.directory))].sort()
+    console.log(`Found ${allDirs.length} project directories in the OpenCode service.`)
     console.log()
 
     // Filter to directories that have memory files
@@ -128,7 +125,5 @@ export async function reindex(opts: { dryRun: boolean }) {
     if (failed > 0) {
       throw new Error(`Failed to reindex ${failed} collection${failed === 1 ? "" : "s"}.`)
     }
-  } finally {
-    db.close()
   }
 }

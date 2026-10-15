@@ -1,6 +1,6 @@
 {
   "name": "opencode-memsearch",
-  "version": "0.6.0",
+  "version": "1.0.0",
   "description": "Persistent cross-session memory for OpenCode, powered by memsearch",
   "type": "module",
   "main": "dist/index.js",
@@ -17,6 +17,8 @@
   "files": [
     "dist",
     "src/daemon-client.ts",
+    "src/memory.ts",
+    "src/service.ts",
     "scripts/cli.ts",
     "scripts/lib.ts",
     "scripts/memsearch-daemon.py",
@@ -24,7 +26,7 @@
     "scripts/seed-memories.ts"
   ],
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target node --external @opencode-ai/plugin && tsc --emitDeclarationOnly",
+    "build": "bun build ./src/index.ts --outdir ./dist --target node --packages external && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build",
     "test": "bun test"
@@ -48,11 +50,11 @@
     "url": "https://github.com/jdormit/opencode-memsearch/issues"
   },
   "homepage": "https://github.com/jdormit/opencode-memsearch#readme",
-  "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.0.0"
+  "dependencies": {
+    "@opencode/client": "^2.0.29",
+    "@opencode/plugin": "^2.0.29"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.3.3",
     "@types/bun": "^1.3.11",
     "typescript": "^5.8.0"
   }

@@ -42,12 +42,12 @@ If `memsearch` is not installed, the plugin's tools will return a clear error me
 
 ## Install
 
-Add `opencode-memsearch` to the plugin list in your OpenCode config:
+Requires OpenCode 2.0.29 or later. Add `opencode-memsearch` to `plugins` in your OpenCode 2 config:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-memsearch"]
+  "plugins": ["opencode-memsearch"]
 }
 ```
 
@@ -57,18 +57,32 @@ This can go in either:
 
 OpenCode will install the npm package automatically on startup.
 
+### Using OpenCode 1.x
+
+`opencode-memsearch@0.6.0` is the last V1-compatible release, also available at the `v1` git tag. Use the V1 config key when pinning it:
+
+```json
+{
+  "plugin": ["opencode-memsearch@0.6.0"]
+}
+```
+
 ## How it works
 
 ### Memory capture
 
-When the agent finishes responding (session goes idle), the plugin:
+After a successful top-level session execution (`session.execution.succeeded`), the plugin:
 
-1. Extracts the last conversation turn (user message + agent response)
-2. Summarizes it into 2-6 bullet points using an LLM (Claude Haiku by default, [configurable](#summarization-model)) via `opencode run`
+1. Reads the completed turn through the V2 service, including user messages, assistant text, tool inputs, results, and errors. Idle markers bound each turn, including prompts added while the agent was working.
+2. Summarizes it into 2-6 bullet points using a stateless in-process model call (Claude Haiku by default, [configurable](#summarization-model)). This creates no throwaway sessions and runs no session hooks.
 3. Appends the summary to `.memsearch/memory/YYYY-MM-DD.md`
 4. Re-indexes the memory directory into the vector database
 
 Summaries are written in third person (e.g. "User asked about...", "Agent edited file X...") and include specific file names, function names, and outcomes.
+
+Child/subagent sessions, failed or interrupted executions, and prompts shorter than 10 characters are skipped. Capture is best-effort; if generation fails or returns no usable notes, the plugin stores a concise transcript extract. Each directory's plugin instance handles only sessions in that directory.
+
+Live capture requires the shared OpenCode service, which normal V2 clients use by default. Standalone servers are not supported for transcript capture.
 
 ### Memory recall
 
@@ -99,7 +113,7 @@ You should add `.memsearch/` to your `.gitignore`.
 
 ## CLI
 
-The package includes a CLI for utility tasks. It requires [Bun](https://bun.sh/) to run.
+The package includes a CLI for utility tasks. It requires [Bun](https://bun.sh/) and OpenCode 2 on PATH. The CLI discovers the shared service and runs `opencode service start` if needed, so service configuration and its environment apply.
 
 ```bash
 bunx opencode-memsearch --help
@@ -117,7 +131,16 @@ bunx opencode-memsearch seed
 bunx opencode-memsearch seed --days 30
 ```
 
-The command reads directly from the OpenCode SQLite database, processes all sessions across all projects, summarizes each conversation turn, and writes the results to each project's `.memsearch/memory/` directory. It can be run from anywhere. The seed command respects the same [configuration](#configuration) as the plugin (config file and environment variables).
+The command lists sessions and reads paginated message history through `@opencode/client`, across all projects. It summarizes successful completed turns through the service's stateless generate endpoint and writes results to each project's `.memsearch/memory/` directory. It can be run from anywhere. It skips existing turn anchors and respects the same [configuration](#configuration) as the plugin. It does not read OpenCode's database directly.
+
+### Reindex
+
+```bash
+bunx opencode-memsearch reindex --dry-run
+bunx opencode-memsearch reindex
+```
+
+Reindex discovers project directories through the service, resets their memory collections, and indexes existing Markdown files using the current embedding configuration. It restarts the shared Python daemon so embedding changes take effect. It does not regenerate summaries.
 
 ## Configuration
 
@@ -128,7 +151,7 @@ The plugin can be configured via a JSON config file and/or environment variables
 The plugin looks for config in two locations (highest precedence first):
 
 1. **Project config**: `.memsearch/config.json` in your project root
-2. **Global config**: `~/.config/opencode/memsearch.config.json`
+2. **Global config**: `$XDG_CONFIG_HOME/opencode/memsearch.config.json` (defaults to `~/.config/opencode/memsearch.config.json`)
 
 Both files use the same schema. Values from the project config override the global config.
 
@@ -164,7 +187,7 @@ Or override it with an environment variable:
 export MEMSEARCH_SUMMARIZATION_MODEL="openai/gpt-4.1-mini"
 ```
 
-The model must be available in your OpenCode configuration (i.e., you must have the provider configured and authenticated). Any model ID that works with `opencode run --model <id>` will work here.
+The model must be configured and authenticated in OpenCode. Use `provider/model` or `provider/model#variant`. Live capture uses the directory's model configuration; the seed command's service generate endpoint uses the global configuration, so seed models must be available globally. Neither path creates a session or launches `opencode run`.
 
 ### Milvus storage
 
@@ -213,7 +236,8 @@ pkill -f memsearch-daemon.py
 | Variable | Description |
 |----------|-------------|
 | `MEMSEARCH_SUMMARIZATION_MODEL` | Override the model used for summarization (takes precedence over config file) |
-| `MEMSEARCH_DISABLE` | Set to any value to disable the plugin entirely (used internally to prevent recursion during summarization) |
+
+Set `MEMSEARCH_SUMMARIZATION_MODEL` in the service's environment (`service.json` → `env`) when running the shared background service. The CLI also reads it from its own environment. `MEMSEARCH_DISABLE` is no longer needed: stateless generation cannot trigger memory capture.
 
 ### Precedence
 

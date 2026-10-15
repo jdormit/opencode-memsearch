@@ -27,7 +27,7 @@ Run 'opencode-memsearch <command> --help' for command-specific help.`
 
 const SEED_HELP = `Seed memsearch memory files from recent OpenCode sessions.
 
-Reads all sessions from the OpenCode SQLite database, summarizes each
+Lists sessions through the OpenCode 2 service, summarizes each completed
 conversation turn via an LLM, and writes the results to each project's
 .memsearch/memory/ directory. Processes all projects; can be run from anywhere.
 
@@ -40,7 +40,7 @@ Options:
 
 const REINDEX_HELP = `Reset and rebuild the vector index from existing memory files.
 
-Discovers all project directories from the OpenCode session database,
+Discovers all project directories through the OpenCode 2 service,
 resets each memsearch collection, and re-indexes the .memsearch/memory/
 markdown files using the currently configured embedding provider.
 

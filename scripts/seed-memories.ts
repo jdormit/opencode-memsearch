@@ -1,480 +1,69 @@
-/**
- * seed-memories.ts — Seed memsearch memory files from recent OpenCode sessions.
- *
- * This module exports a `seed` function used by the CLI (cli.ts).
- *
- * What it does:
- * 1. Reads session + message data directly from the OpenCode SQLite database
- * 2. For each session, formats each conversation turn as a transcript
- * 3. Summarizes each turn via `opencode run` (model is configurable, see README)
- * 4. Writes summaries to .memsearch/memory/YYYY-MM-DD.md files per project
- * 5. Indexes all memory files with memsearch
- */
+import { appendFile, mkdir, readFile } from "node:fs/promises"
+import { join } from "node:path"
+import { connect, listSessions, readMessages, deriveCollectionName, detectMemsearch, callPluginDaemon, startPluginDaemon } from "./lib"
+import { formatConciseSummary, formatTurnTranscript, getUserText, splitIntoTurns, summarizationModel, summarizeTranscript } from "../src/memory"
 
-import { Database } from "bun:sqlite"
-import { appendFile, mkdir, readFile, writeFile, unlink } from "fs/promises"
-import { join } from "path"
-import { homedir, tmpdir } from "os"
-import { $ } from "bun"
-
-import {
-  DB_PATH,
-  DbSession,
-  deriveCollectionName,
-  detectMemsearch,
-  listSessionsFromDb,
-  callPluginDaemon,
-  startPluginDaemon,
-} from "./lib"
-
-// --- Configuration ---
-
-interface PluginConfig {
-  /** Model ID used for summarization (e.g. "anthropic/claude-haiku-4-5") */
-  summarization_model?: string
+function dateParts(time: number): [string, string] {
+  const d = new Date(time)
+  return [`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`, `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`]
 }
 
-const DEFAULT_SUMMARIZATION_MODEL = "anthropic/claude-haiku-4-5"
-const GLOBAL_CONFIG_PATH = join(homedir(), ".config", "opencode", "memsearch.config.json")
-
-async function loadJsonConfig(path: string): Promise<Partial<PluginConfig>> {
-  try {
-    const content = await readFile(path, "utf-8")
-    return JSON.parse(content)
-  } catch {
-    return {}
-  }
-}
-
-async function loadConfig(projectDir: string): Promise<PluginConfig> {
-  const projectPath = join(projectDir, ".memsearch", "config.json")
-  const globalConfig = await loadJsonConfig(GLOBAL_CONFIG_PATH)
-  const projectConfig = await loadJsonConfig(projectPath)
-  return { ...globalConfig, ...projectConfig }
-}
-
-function getSummarizationModel(config: PluginConfig): string {
-  return (
-    process.env.MEMSEARCH_SUMMARIZATION_MODEL ||
-    config.summarization_model ||
-    DEFAULT_SUMMARIZATION_MODEL
-  )
-}
-
-// --- Config ---
-
-const SUMMARIZE_PROMPT = `You are a third-person note-taker. The attached file contains a transcript of ONE conversation turn between a human and an AI coding agent. Tool calls are labeled [Tool Call] and their results [Tool Result] or [Tool Error].
-
-Your job is to record what happened as factual third-person notes. You are an EXTERNAL OBSERVER. Do NOT answer the human's question, do NOT give suggestions, do NOT offer help. ONLY record what occurred.
-
-Output 2-6 bullet points, each starting with '- '. NOTHING else.
-
-Rules:
-- Write in third person: 'User asked...', 'Agent read file X', 'Agent ran command Y'
-- First bullet: what the user asked or wanted (one sentence)
-- Remaining bullets: what the agent did — tools called, files read/edited, commands run, key findings
-- Be specific: mention file names, function names, tool names, and concrete outcomes
-- Do NOT answer the human's question yourself — just note what was discussed
-- Do NOT add any text before or after the bullet points
-- Do NOT continue the conversation after the bullet points
-- Do NOT ask follow-up questions
-- STOP immediately after the last bullet point`
-
-const TEMP_DIR = join(tmpdir(), "memsearch-seed")
-
-// --- Helpers ---
-
-function formatDate(epochMs: number): string {
-  const d = new Date(epochMs)
-  const yyyy = d.getFullYear()
-  const mm = String(d.getMonth() + 1).padStart(2, "0")
-  const dd = String(d.getDate()).padStart(2, "0")
-  return `${yyyy}-${mm}-${dd}`
-}
-
-function formatTime(epochMs: number): string {
-  const d = new Date(epochMs)
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
-}
-
-// --- Database types ---
-
-interface DbMessage {
-  id: string
-  session_id: string
-  time_created: number
-  data: string // JSON
-}
-
-interface DbPart {
-  id: string
-  message_id: string
-  time_created: number
-  data: string // JSON
-}
-
-// --- Database access ---
-
-function getSessionMessages(
-  db: Database,
-  sessionId: string,
-): { info: any; parts: any[] }[] {
-  // Get messages
-  const dbMessages = db.query<DbMessage, [string]>(`
-    SELECT id, session_id, time_created, data
-    FROM message
-    WHERE session_id = ?
-    ORDER BY time_created ASC
-  `).all(sessionId)
-
-  if (dbMessages.length === 0) return []
-
-  // Get all parts for this session in one query
-  const dbParts = db.query<DbPart, [string]>(`
-    SELECT id, message_id, time_created, data
-    FROM part
-    WHERE session_id = ?
-    ORDER BY time_created ASC
-  `).all(sessionId)
-
-  // Group parts by message_id
-  const partsByMessage = new Map<string, any[]>()
-  for (const p of dbParts) {
-    if (!partsByMessage.has(p.message_id)) partsByMessage.set(p.message_id, [])
-    partsByMessage.get(p.message_id)!.push(JSON.parse(p.data))
-  }
-
-  // Assemble messages with their parts
-  return dbMessages.map((m) => ({
-    info: JSON.parse(m.data),
-    parts: partsByMessage.get(m.id) || [],
-  }))
-}
-
-// --- Message processing ---
-
-function splitIntoTurns(
-  messages: { info: any; parts: any[] }[],
-): { info: any; parts: any[] }[][] {
-  const turns: { info: any; parts: any[] }[][] = []
-  let current: { info: any; parts: any[] }[] = []
-
-  for (const msg of messages) {
-    if (msg.info.role === "user" && current.length > 0) {
-      turns.push(current)
-      current = []
-    }
-    current.push(msg)
-  }
-  if (current.length > 0) {
-    turns.push(current)
-  }
-
-  return turns
-}
-
-function formatTurnTranscript(
-  turn: { info: any; parts: any[] }[],
-): string {
-  const lines: string[] = [
-    "=== Transcript of a conversation turn between a human and an AI coding agent ===",
-  ]
-
-  for (const msg of turn) {
-    const role = msg.info.role
-    for (const part of msg.parts) {
-      if (part.type === "text" && part.text?.trim()) {
-        if (role === "user") {
-          lines.push(`[Human]: ${part.text.trim()}`)
-        } else if (role === "assistant") {
-          lines.push(`[Assistant]: ${part.text.trim()}`)
-        }
-      } else if (part.type === "tool-invocation" || part.type === "tool_use") {
-        const name = part.toolName || part.name || "unknown"
-        const args = part.args || part.input || {}
-        const argParts: string[] = []
-        for (const [k, v] of Object.entries(args)) {
-          let vStr = String(v)
-          if (vStr.length > 120) vStr = vStr.slice(0, 120) + "..."
-          argParts.push(`${k}=${vStr}`)
-        }
-        let argSummary = argParts.join(", ")
-        if (argSummary.length > 400)
-          argSummary = argSummary.slice(0, 400) + "..."
-        lines.push(`[Tool Call]: ${name}(${argSummary})`)
-      } else if (part.type === "tool-result" || part.type === "tool_result") {
-        const output = String(part.output || part.content || "").slice(0, 1000)
-        const isError = part.isError || part.is_error
-        const label = isError ? "[Tool Error]" : "[Tool Result]"
-        lines.push(`${label}: ${output}`)
-      }
-    }
-  }
-
-  return lines.join("\n")
-}
-
-function formatConciseSummary(
-  turn: { info: any; parts: any[] }[],
-): string {
-  const lines: string[] = []
-
-  for (const msg of turn) {
-    const role = msg.info.role
-    for (const part of msg.parts) {
-      if (part.type === "text" && part.text?.trim()) {
-        if (role === "user") {
-          const text = part.text.trim()
-          lines.push(`- User asked: ${text.length > 200 ? text.slice(0, 200) + "..." : text}`)
-        } else if (role === "assistant") {
-          const text = part.text.trim()
-          if (text.length > 0) {
-            lines.push(`- Agent responded: ${text.length > 200 ? text.slice(0, 200) + "..." : text}`)
-          }
-        }
-      } else if (part.type === "tool-invocation" || part.type === "tool_use") {
-        const name = part.toolName || part.name || "unknown"
-        const args = part.args || part.input || {}
-        const keyArgs: string[] = []
-        for (const [k, v] of Object.entries(args)) {
-          const vStr = String(v)
-          if (vStr.length <= 100) {
-            keyArgs.push(`${k}=${vStr}`)
-          } else {
-            keyArgs.push(`${k}=${vStr.slice(0, 80)}...`)
-          }
-        }
-        lines.push(`- Tool: ${name}(${keyArgs.join(", ").slice(0, 300)})`)
-      }
-    }
-  }
-
-  return lines.slice(0, 20).join("\n")
-}
-
-function getUserText(turn: { info: any; parts: any[] }[]): string {
-  for (const msg of turn) {
-    if (msg.info.role === "user") {
-      for (const part of msg.parts) {
-        if (part.type === "text" && part.text) {
-          return part.text.trim()
-        }
-      }
-    }
-  }
-  return ""
-}
-
-// Summarize a transcript via `opencode run`
-async function summarizeWithOpencode(transcript: string, tempFile: string, model: string): Promise<string> {
-  // Write transcript to temp file
-  await writeFile(tempFile, transcript)
-
-  try {
-    // Disable all plugins during summarization to avoid memsearch plugin
-    // interfering with the LLM output (e.g. injecting "[memsearch] Memory available")
-    const rawOutput = await $`opencode run -f ${tempFile} --model ${model} ${SUMMARIZE_PROMPT}`
-      .env({ ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [] }) })
-      .nothrow()
-      .quiet()
-      .text()
-
-    // Parse output: only keep bullet lines that start with "User " or "Agent "
-    // (matching the third-person format from the prompt). The agent sometimes
-    // appends conversational junk like "- Do you want me to..." which we discard.
-    const lines = rawOutput.split("\n")
-    const bulletLines = lines
-      .filter((l) => l.trimStart().startsWith("- "))
-      .filter((l) => {
-        const content = l.trimStart().slice(2) // strip "- "
-        return content.startsWith("User ") || content.startsWith("Agent ")
-      })
-    return bulletLines.join("\n").trim()
-  } finally {
-    try {
-      await unlink(tempFile)
-    } catch {}
-  }
-}
-
-// --- Main ---
-
-export async function seed(opts: { days: number }) {
-  const { days } = opts
-  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
-
-  console.log(`Seeding memories from the last ${days} days...`)
-  console.log()
-
-  // Setup
+export async function seed({ days }: { days: number }) {
   await detectMemsearch()
-
-  await mkdir(TEMP_DIR, { recursive: true })
-
-  // Open database (read-only)
-  const db = new Database(DB_PATH, { readonly: true })
-
-  try {
-    // List sessions
-    const allSessions = listSessionsFromDb(db, cutoff)
-    console.log(`Found ${allSessions.length} sessions in the last ${days} days.`)
-    console.log()
-
-    if (allSessions.length === 0) {
-      console.log("No sessions to process.")
-      return
-    }
-
-    // Group by directory for display
-    const byDir = new Map<string, DbSession[]>()
-    for (const s of allSessions) {
-      if (!byDir.has(s.directory)) byDir.set(s.directory, [])
-      byDir.get(s.directory)!.push(s)
-    }
-
-    console.log(`Projects:`)
-    const summarizationModels = new Map<string, string>()
-    for (const [dir, sessions] of byDir) {
-      const model = getSummarizationModel(await loadConfig(dir))
-      summarizationModels.set(dir, model)
-      console.log(`  ${dir} (${sessions.length} sessions, model: ${model})`)
-    }
-    console.log()
-
-    // Track which memory dirs we need to index at the end
-    const memoryDirs = new Map<string, string>() // memoryDir -> collectionName
-
-    let sessionNum = 0
-    let totalTurns = 0
-    let totalSummarized = 0
-
-    for (const session of allSessions) {
-      sessionNum++
-      const sessionDir = session.directory
-      const memsearchDir = join(sessionDir, ".memsearch")
-      const memoryDir = join(memsearchDir, "memory")
-      const collectionName = deriveCollectionName(sessionDir)
-      memoryDirs.set(memoryDir, collectionName)
-
-      await mkdir(memoryDir, { recursive: true })
-
-      const titleDisplay = session.title.length > 50
-        ? session.title.slice(0, 50) + "..."
-        : session.title
-
-      // Read messages from DB
-      const messages = getSessionMessages(db, session.id)
-
-      if (messages.length < 2) {
-        console.log(`  [${sessionNum}/${allSessions.length}] "${titleDisplay}" — ${messages.length} messages, skipping`)
-        continue
-      }
-
-      // Split into turns
-      const turns = splitIntoTurns(messages)
-      const substantiveTurns = turns.filter((t) => {
-        const userText = getUserText(t)
-        return userText.length >= 10 && t.length >= 2
-      })
-
-      if (substantiveTurns.length === 0) {
-        console.log(`  [${sessionNum}/${allSessions.length}] "${titleDisplay}" — no substantive turns, skipping`)
-        continue
-      }
-
-      console.log(`  [${sessionNum}/${allSessions.length}] "${titleDisplay}" — ${substantiveTurns.length} turns`)
-
-      const sessionDate = formatDate(session.time_created)
-      const sessionTime = formatTime(session.time_created)
-      const memoryFile = join(memoryDir, `${sessionDate}.md`)
-      let existingMemory = ""
+  const client = await connect(true)
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
+  const sessions = (await listSessions(client)).filter((s) => !s.parentID && s.time.created >= cutoff)
+  console.log(`Seeding ${sessions.length} sessions from the last ${days} days across all projects.`)
+  const memoryDirs = new Map<string, string>()
+  let total = 0
+  let generated = 0
+  for (const session of sessions) {
+    const directory = session.location.directory
+    const memoryDir = join(directory, ".memsearch", "memory")
+    const turns = splitIntoTurns(await readMessages(client, session.id))
+      .filter((turn) => getUserText(turn).length >= 10 && turn.some((m) => m.type === "assistant"))
+    if (!turns.length) continue
+    await mkdir(memoryDir, { recursive: true })
+    memoryDirs.set(memoryDir, deriveCollectionName(directory))
+    const [day, time] = dateParts(session.time.created)
+    const file = join(memoryDir, `${day}.md`)
+    let existing = await readFile(file, "utf8").catch(() => "")
+    const legacyCount = existing.split(`<!-- session:${session.id} -->`).length - 1
+    let headingWritten = legacyCount > 0 || existing.includes(`<!-- session:${session.id} turn:`)
+    const model = await summarizationModel(directory)
+    for (const [index, turn] of turns.entries()) {
+      const anchor = `<!-- session:${session.id} turn:${index} -->`
+      if (index < legacyCount || existing.includes(anchor)) continue
+      let summary = ""
       try {
-        existingMemory = await readFile(memoryFile, "utf-8")
-      } catch {}
-
-      // Older versions used one session-only anchor per completed turn.
-      const legacyAnchor = `<!-- session:${session.id} -->`
-      const legacyTurnCount = existingMemory.split(legacyAnchor).length - 1
-
-      // Process each turn
-      let headingWritten = legacyTurnCount > 0 || existingMemory.includes(`<!-- session:${session.id} turn:`)
-      for (let turnIdx = 0; turnIdx < substantiveTurns.length; turnIdx++) {
-        const turn = substantiveTurns[turnIdx]
-        const anchor = `<!-- session:${session.id} turn:${turnIdx} -->`
-        if (turnIdx < legacyTurnCount || existingMemory.includes(anchor)) continue
-        totalTurns++
-
-        const turnTime = turn[0].info.time?.created
-          ? formatTime(turn[0].info.time.created)
-          : sessionTime
-
-        const transcript = formatTurnTranscript(turn)
-        if (!transcript || transcript.split("\n").length < 3) continue
-
-        // Summarize via opencode run (separate process per turn, no memory accumulation)
-        const tempFile = join(TEMP_DIR, `turn-${sessionNum}-${turnIdx}.txt`)
-        let summary = ""
-        try {
-          summary = await summarizeWithOpencode(
-            transcript,
-            tempFile,
-            summarizationModels.get(sessionDir) || DEFAULT_SUMMARIZATION_MODEL,
-          )
-          if (summary) totalSummarized++
-        } catch {
-          // LLM failed
-        }
-
-        if (!summary) {
-          summary = formatConciseSummary(turn)
-        }
-
-        if (!summary) continue
-
-        if (!headingWritten) {
-          await appendFile(memoryFile, `\n## Session ${sessionTime} — ${session.title}\n\n`)
-          headingWritten = true
-        }
-        const entry = `### ${turnTime}\n${anchor}\n${summary}\n\n`
-        await appendFile(memoryFile, entry)
-        existingMemory += entry
-
-        // Print progress on long sessions
-        if (substantiveTurns.length > 5 && (turnIdx + 1) % 5 === 0) {
-          process.stdout.write(`    (${turnIdx + 1}/${substantiveTurns.length} turns)\n`)
-        }
+        summary = await summarizeTranscript(client.generate, formatTurnTranscript(turn), model)
+        if (summary) generated++
+      } catch (error) {
+        console.warn(`Summarization failed for ${session.id}; using transcript extract:`, error)
       }
+      summary ||= formatConciseSummary(turn)
+      if (!summary) continue
+      const [, turnTime] = dateParts(turn[0].time.created)
+      const heading = headingWritten ? "" : `\n## Session ${time} — ${session.title || session.id}\n\n`
+      const entry = `${heading}### ${turnTime}\n${anchor}\n${summary}\n\n`
+      await appendFile(file, entry)
+      existing += entry
+      headingWritten = true
+      total++
     }
-
-    console.log()
-    console.log(`Processed ${totalTurns} turns, summarized ${totalSummarized} with LLM.`)
-    console.log()
-
-    // Index all memory directories
-    const daemon = await startPluginDaemon()
-    let indexFailures = 0
-    for (const [memDir, collectionName] of memoryDirs) {
-      console.log(`Indexing ${memDir} (collection: ${collectionName})...`)
-      try {
-        await callPluginDaemon(daemon, { cmd: "index", collection: collectionName, paths: [memDir] })
-        console.log(`  Done.`)
-      } catch (err) {
-        console.error(`  Failed to index: ${err}`)
-        indexFailures++
-      }
-    }
-
-    if (indexFailures > 0) {
-      throw new Error(`Failed to index ${indexFailures} project${indexFailures === 1 ? "" : "s"}.`)
-    }
-
-    console.log()
-    console.log("Seeding complete!")
-  } finally {
-    db.close()
-    // Clean up temp dir
-    try {
-      await $`rm -rf ${TEMP_DIR}`.nothrow().quiet()
-    } catch {}
+    console.log(`${session.title || session.id}: ${turns.length} completed turns`)
   }
+  console.log(`Wrote ${total} summaries (${generated} generated by the model).`)
+  if (!memoryDirs.size) return
+  const daemon = await startPluginDaemon()
+  let failures = 0
+  for (const [memoryDir, collection] of memoryDirs) {
+    try {
+      await callPluginDaemon(daemon, { cmd: "index", collection, paths: [memoryDir] })
+    } catch (error) {
+      console.error(`Indexing ${memoryDir} failed:`, error)
+      failures++
+    }
+  }
+  if (failures) throw new Error(`Failed to index ${failures} projects.`)
 }
